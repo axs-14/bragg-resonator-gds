@@ -188,6 +188,8 @@ print("NOTE: this search assumes footprint width decreases monotonically as "
 #---------------------------------------------#
 #         Boolean Merge and Background        #
 #---------------------------------------------#
+gdspy.current_library.cells.clear()
+
 merged_cell = gdspy.Cell('merge')
 merged_path = gdspy.fast_boolean(total_structure, None, 'or', max_points=0)
 
