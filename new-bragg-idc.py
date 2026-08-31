@@ -27,8 +27,21 @@ edge_margin = 150.0         # um, keep-out from top/bottom edges
 gap1, width1 = 95, 4        # high-impedance section
 gap2, width2 = 52, 90       # low-impedance section
 
-# --- Launcher CPW cross-section ---
-launcher_gap, launcher_width = 52, 90
+# --- Launcher CPW cross-sections (independent per end) ---
+# The line each bond pad tapers down into. These are NOT sections of the
+# layout -- no run of line exists at these dimensions, they only set what the
+# taper ends on. The two ends of the mirror have different cross-sections
+# (section 1 is high-Z, section 6 is low-Z with an even section count), so
+# matching each launcher to its own adjoining section takes two sets of
+# numbers.
+#
+# Setting these equal to the adjoining section removes the geometric step at
+# the butt joint but makes the pad non-50-ohm, which moves the mismatch to
+# the wirebond instead of removing it. 30/50 is roughly 50 ohm on silicon.
+# The high-Z 4/95 cross-section is far from 50 ohm, so a left launcher set
+# that way will reflect hard at the port -- see the printed report.
+launcher_l_gap, launcher_l_width = 95, 4     # matches section 1 (high-Z)
+launcher_r_gap, launcher_r_width = 52, 90    # matches section 6 (low-Z)
 
 # --- Launcher (bond pad + taper; physical dimensions, NEVER scaled) ---
 straightLauncher = 500
@@ -224,17 +237,19 @@ def _span_at(ps, x, tol):
     return (max(ys) - min(ys)) if ys else 0.0
 
 
-def build_launcher_template(layer):
+def build_launcher_template(gap, width, label, layer):
     """
-    Build one launcher and normalise it so its narrow (CPW) end is at x = 0
-    with the centre conductor on y = 0, and the pad extends toward +x.
+    Build one launcher at the given CPW cross-section and normalise it so its
+    narrow end is at x = 0 with the centre conductor on y = 0, and the pad
+    extends toward +x.
 
     Which end createLauncherRight puts the pad on is detected from the
     geometry rather than assumed, so this does not depend on the module's
-    positional convention.
+    positional convention. The two ends are built independently, so their
+    lengths are allowed to differ if the taper scales with cross-section.
     """
     raw, _ = GM.createLauncherRight(
-        (0.0, 0.0), gap=launcher_gap, width=launcher_width,
+        (0.0, 0.0), gap=gap, width=width,
         straight=straightLauncher, height=launcherHeight,
         taper=taperLauncher, gapL=gapLauncher, notch=True
     )
@@ -246,8 +261,8 @@ def build_launcher_template(layer):
         (x_lo, y_lo), (x_hi, y_hi) = ps.get_bounding_box()
     ps.translate(-x_lo, -0.5 * (y_lo + y_hi))
     length = x_hi - x_lo
-    print(f"Launcher template: {length:.1f} um long, "
-          f"{y_hi - y_lo:.1f} um tall, narrow end normalised to x=0")
+    print(f"{label} launcher template: {length:.1f} um long, "
+          f"{y_hi - y_lo:.1f} um tall, tapers to {width:.0f}/{gap:.0f}")
     return ps, length
 
 
@@ -267,7 +282,10 @@ pitch = 2.0 * bend_radius + jog_margin
 cpw_halfspan = max(w / 2.0 + g for g, w in section_xsec)
 y_c = chip_height / 2.0
 
-launcher_template, launcher_len = build_launcher_template(layer)
+tmpl_l, len_l = build_launcher_template(
+    launcher_l_gap, launcher_l_width, "Left", layer)
+tmpl_r, len_r = build_launcher_template(
+    launcher_r_gap, launcher_r_width, "Right", layer)
 
 print("\nturns   leg height   mirror width   total width   vertical span")
 chosen = None
@@ -275,14 +293,14 @@ for n_turns in range(turns_min, turns_max + 1):
     h = leg_height_for(total_length, n_turns, pitch, lead_run, bend_radius)
     span = h + 2.0 * cpw_halfspan
     w_mirror = 2.0 * lead_run + n_turns * pitch
-    w_total = w_mirror + 2.0 * launcher_len
+    w_total = w_mirror + len_l + len_r
     ok = (h >= 4.0 * bend_radius        # half legs are h/2, fillet at each end
           and span <= chip_height - 2.0 * edge_margin
           and w_total <= chip_width)
     print(f"{n_turns:5d}   {h:10.1f}   {w_mirror:12.1f}   {w_total:11.1f}"
           f"   {span:13.1f}   {'fits' if ok else ''}")
     if ok and chosen is None:
-        x0 = 0.5 * (chip_width - w_total) + launcher_len
+        x0 = 0.5 * (chip_width - w_total) + len_l
         verts = serpentine_vertices(x0, y_c, n_turns, h, pitch, lead_run)
         try:
             chosen = (n_turns, h, w_total, verts,
@@ -333,15 +351,17 @@ exit_pt = (float(dense[-1][0]), float(dense[-1][1]))
 # --------------------------------------------------------------------- #
 #              Launchers butted onto both mirror ends                   #
 # --------------------------------------------------------------------- #
-launcher_l = place_launcher(launcher_template, entry_pt, 'left', layer)
-launcher_r = place_launcher(launcher_template, exit_pt, 'right', layer)
+launcher_l = place_launcher(tmpl_l, entry_pt, 'left', layer)
+launcher_r = place_launcher(tmpl_r, exit_pt, 'right', layer)
 
-for name, pt, (g_k, w_k) in (("left", entry_pt, section_xsec[0]),
-                             ("right", exit_pt, section_xsec[-1])):
-    step = abs((w_k / 2.0 + g_k) - (launcher_width / 2.0 + launcher_gap))
-    print(f"{name} launcher butts onto section cross-section "
-          f"{w_k:.0f}/{g_k:.0f} at x={pt[0]:.1f}; outer half-span step "
-          f"{step:.1f} um")
+for name, pt, (g_k, w_k), (g_L, w_L) in (
+        ("left", entry_pt, section_xsec[0], (launcher_l_gap, launcher_l_width)),
+        ("right", exit_pt, section_xsec[-1], (launcher_r_gap, launcher_r_width))):
+    step_outer = abs((w_k / 2.0 + g_k) - (w_L / 2.0 + g_L))
+    step_inner = abs(w_k - w_L)
+    print(f"{name:>5} launcher: taper ends {w_L:.0f}/{g_L:.0f}, butts onto "
+          f"section {w_k:.0f}/{g_k:.0f} at x={pt[0]:.1f}  ->  "
+          f"conductor step {step_inner:.1f} um, ground step {step_outer:.1f} um")
 
 total_structure = mirror_polys + [launcher_l, launcher_r]
 
