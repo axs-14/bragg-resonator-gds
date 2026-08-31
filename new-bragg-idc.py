@@ -1,250 +1,390 @@
 # -*- coding: utf-8 -*-
 """
 Created on Thursday Aug 27 17:00:00 2026
-Modified: 5000 x 10000 um chip. Left launcher removed and replaced with an
-IDC quarter-wave resonator (per Fig. 6 of the reference), galvanically
-connected into the stepped-impedance (meander Bragg) filter. Whole
-assembly centered on the chip.
+Modified: 5000 x 10000 um chip. Stepped-impedance (meander Bragg) filter
+built as a single serpentine, launched from both ends. Whole assembly
+centered on the chip.
 
 @author: Aryan Soni
 """
 
 import numpy as np
 import gdspy
-import gds_maker as GM  # Custom module
+import gds_maker as GM  # Custom module -- used for the launchers only
 
-#---------------------------------------------#
-#              Design Parameters              #
-#---------------------------------------------#
-filename = 'AS_bragg_idc_launcher.gds'
-write_gaps = False  # True to write just shapes, False to subtract from background
+# --------------------------------------------------------------------- #
+#                          Design Parameters                            #
+# --------------------------------------------------------------------- #
+filename = 'AS_bragg_two_launchers.gds'
+write_gaps = False          # True = write shapes; False = subtract from ground
 
-# --- Target chip envelope ---
-chip_height = 5000     # microns 
-chip_width  = 10000    # microns 
-left_offset = 250.0   # microns (distance from left edge of chip to start of IDC)
+# --- Chip envelope ---
+chip_height = 5000          # um
+chip_width = 10000          # um
+edge_margin = 150.0         # um, keep-out from top/bottom edges
 
-# --- IDC quarter-wave resonator ---
-idc_l0 = 240.0   # total resonator length, um
-idc_w  = 2.0     # inner trunk track width, um
-idc_s  = 2.0     # finger width, um
-idc_h  = 46.0    # finger length, um
-idc_g  = 2.0     # finger-tip-to-opposite-conductor clearance, um
+# --- Bragg mirror cross-sections (set impedance; NEVER scaled) ---
+gap1, width1 = 95, 4        # high-impedance section
+gap2, width2 = 52, 90       # low-impedance section
 
-# --- Base (packing_scale=1) packing geometry for the meander/Bragg section ---
-radius_0            = 400
-gap_0               = 30
-width_0             = 50
-gap1_0, width1_0     = 95, 4     # high-impedance Bragg section
-gap2_0, width2_0     = 52, 90     # low-impedance Bragg section
-feedline_length_0    = 0
-straightLauncher_0   = 500
-taperLauncher_0      = 500
-launcherHeight_0     = 500
-gapLauncher_0        = 125
+# --- Launcher CPW cross-section ---
+# This is the line the bond pad tapers down into. It is NOT a section of the
+# layout -- there is no run of 50 ohm line anywhere. 30/50 gives ~50 ohm on
+# silicon, which is what you want the wirebond and coax to see. The mirror
+# butts straight onto it, so there is an abrupt step from the adjoining
+# section's cross-section (97 um outer half-span) to this one (55 um).
+# To remove the step instead, set these equal to the adjoining section --
+# but then the pad is no longer 50 ohm and the mismatch just moves to the
+# wirebond. Keeping it at 50 ohm is usually the right call: the step at the
+# mirror end is part of the mirror, the one at the pad is not.
+launcher_gap, launcher_width = 30, 50
 
-frequency = 7.2e9              # Hz
-epsilon = 11.7               # substrate relative permittivity
-c = 3e8                      # m/s
+# --- Launcher (bond pad + taper; physical dimensions, NEVER scaled) ---
+straightLauncher = 500
+taperLauncher = 500
+launcherHeight = 500
+gapLauncher = 125
+
+# --- Serpentine packing ---
+bend_radius = 400.0         # um, 180-deg turn radius
+jog_margin = 20.0           # um of straight inside each 180-deg turn
+lead_run = 400.0            # um of horizontal run at each end of the mirror
+arc_step_deg = 1.0          # centerline arc discretisation
+turns_min, turns_max = 3, 14
+
+# --- Electrical ---
+frequency = 7.2e9
+epsilon = 11.7
+c = 3e8
 no_of_quarterwave_resonators = 6
 layer = 1
 
 quarterwave_resonator_length = 1e6 * c / (np.sqrt((epsilon + 1) / 2) * frequency * 4)
-print(f"Meander quarter-wave length (frequency-locked) = {quarterwave_resonator_length:.1f} um")
+
+# Per-section electrical lengths. Both entries default to the same value,
+# which is what the original script assumed. That is only correct if the two
+# sections share an eps_eff -- they do not (4/95 vs 90/52 CPW have different
+# filling factors), so each section is only approximately lambda/4 here.
+# Replace with per-section values once you have eps_eff from a solver.
+section_lengths = [quarterwave_resonator_length] * no_of_quarterwave_resonators
+section_xsec = [(gap1, width1) if k % 2 == 0 else (gap2, width2)
+                for k in range(no_of_quarterwave_resonators)]
+total_length = float(np.sum(section_lengths))
+
+print(f"Quarter-wave length (frequency-locked) = "
+      f"{quarterwave_resonator_length:.1f} um")
+print(f"Total mirror path length = {total_length:.1f} um "
+      f"({no_of_quarterwave_resonators} sections)")
 
 
-#---------------------------------------------#
-#        IDC quarter-wave resonator           #
-#---------------------------------------------#
-def _rect(x_lo, y_lo, x_hi, y_hi, layer):
-    return gdspy.Rectangle((x_lo, y_lo), (x_hi, y_hi), layer=layer)
+# --------------------------------------------------------------------- #
+#                     Centerline geometry helpers                       #
+# --------------------------------------------------------------------- #
+def _unit(v):
+    n = np.hypot(v[0], v[1])
+    return v / n if n else v
 
 
-def build_IDC(x0, y_center, l0, w, s, h, g, layer):
+def fillet_polyline(pts, radius, arc_step_deg=1.0):
     """
-    Interdigitated-capacitor quarter-wave section.
-
-    Trunk (width w) runs continuously along the centerline -- galvanic
-    connection preserved throughout, as in the reference. Above and below
-    the trunk, alternating fingers reach in from the trunk and from the
-    outer ground plane, each of width s, each stopping short of the
-    opposite conductor by a gap g. Left end (x0) is left unslotted, so the
-    trunk grows directly out of the surrounding solid ground plane there
-    (a galvanic short to ground, mirroring the reference sketch's
-    grounded end). Right end hands off to the stepped-impedance filter
-    with no taper (intentional impedance step).
-
-    Returns (list_of_gap_polygons, (end_x, end_y)).
+    Replace every interior vertex of a polyline with a circular arc of the
+    given radius, returning a densely sampled point list. Because the arcs
+    are baked into the point list, downstream FlexPath calls need no corner
+    processing and section boundaries can be cut at any arc length.
     """
-    polys = []
-    seg = s
-    n_segments = int(l0 // seg)
+    pts = [np.asarray(p, dtype=float) for p in pts]
+    out = [pts[0]]
+    for i in range(1, len(pts) - 1):
+        a, b, c = pts[i - 1], pts[i], pts[i + 1]
+        v1, v2 = _unit(a - b), _unit(c - b)
+        phi = np.arccos(np.clip(np.dot(v1, v2), -1.0, 1.0))
+        if phi > np.pi - 1e-9:      # collinear, nothing to fillet
+            continue
+        t = radius / np.tan(phi / 2.0)
+        if t > np.hypot(*(a - b)) + 1e-9 or t > np.hypot(*(c - b)) + 1e-9:
+            raise ValueError(
+                f"vertex {i}: fillet tangent {t:.1f} um exceeds an adjoining "
+                f"segment -- radius too large for this packing."
+            )
+        p_s, p_e = b + v1 * t, b + v2 * t
+        centre = b + _unit(v1 + v2) * (radius / np.sin(phi / 2.0))
+        a0 = np.arctan2(*(p_s - centre)[::-1])
+        a1 = np.arctan2(*(p_e - centre)[::-1])
+        sweep = (a1 - a0 + np.pi) % (2 * np.pi) - np.pi
+        n = max(2, int(abs(np.degrees(sweep)) / arc_step_deg) + 1)
+        out.append(p_s)
+        for k in range(1, n):
+            th = a0 + sweep * k / n
+            out.append(centre + radius * np.array([np.cos(th), np.sin(th)]))
+        out.append(p_e)
+    out.append(pts[-1])
 
-    for j in range(n_segments):
-        x_lo = x0 + j * seg
-        x_hi = x_lo + seg
-        if j % 2 == 1:
-            # lateral gap between adjacent fingers: full comb-band height
-            polys.append(_rect(x_lo, y_center + w / 2, x_hi, y_center + w / 2 + h + g, layer))
-            polys.append(_rect(x_lo, y_center - w / 2 - h - g, x_hi, y_center - w / 2, layer))
+    ded = [out[0]]
+    for p in out[1:]:
+        if np.hypot(*(p - ded[-1])) > 1e-9:
+            ded.append(p)
+    return ded
+
+
+def arclen(pts):
+    d = np.diff(np.asarray(pts, dtype=float), axis=0)
+    return float(np.hypot(d[:, 0], d[:, 1]).sum())
+
+
+def split_by_lengths(pts, lengths):
+    """
+    Cut a dense polyline into consecutive runs of the given arc lengths.
+    Boundary points are interpolated exactly, so each run has the requested
+    electrical length and adjacent runs share an endpoint.
+    Returns (list_of_runs, list_of_(boundary_point, segment_index)).
+    """
+    pts = [np.asarray(p, dtype=float) for p in pts]
+    cuts = np.cumsum(lengths)[:-1]
+    runs, bounds = [], []
+    cur = [pts[0]]
+    s, ci = 0.0, 0
+    for i in range(len(pts) - 1):
+        a, b = pts[i], pts[i + 1]
+        seg = np.hypot(*(b - a))
+        while ci < len(cuts) and s + seg >= cuts[ci] - 1e-9:
+            f = (cuts[ci] - s) / seg
+            q = a + (b - a) * f
+            if np.hypot(*(q - cur[-1])) > 1e-9:
+                cur.append(q)
+            runs.append(cur)
+            bounds.append((q, i))
+            cur = [q]
+            ci += 1
+        s += seg
+        if np.hypot(*(b - cur[-1])) > 1e-9:
+            cur.append(b)
+    runs.append(cur)
+    return runs, bounds
+
+
+def cpw_gaps(pts, width, gap, layer):
+    """CPW gap regions for a dense centerline: outer trace minus inner trace."""
+    kw = dict(tolerance=0.01, precision=1e-4, max_points=0)
+    outer = gdspy.FlexPath(pts, width + 2.0 * gap, **kw).to_polygonset()
+    inner = gdspy.FlexPath(pts, width, **kw).to_polygonset()
+    return gdspy.boolean(outer, inner, 'not', layer=layer,
+                         precision=1e-4, max_points=0)
+
+
+# --------------------------------------------------------------------- #
+#                    Serpentine mirror centerline                       #
+# --------------------------------------------------------------------- #
+def serpentine_vertices(x0, y_c, n_turns, leg_height, pitch, lead):
+    """
+    Boustrophedon centerline, entering and leaving horizontally on y_c.
+
+    Layout: lead-in, half leg up, then n_turns 180-deg turns separated by
+    full-height legs, then a half leg back to y_c and a lead-out. The two
+    half legs at the ends put the entry and exit on the chip centerline and
+    keep the vertical extent symmetric about it, so a launcher can butt onto
+    either end with no connecting run.
+
+    Filleted path length is
+        n_turns*leg_height + 2*lead + n_turns*pitch - (2*n_turns+2)*delta
+    with delta = (2 - pi/2)*radius the shortening from one 90-deg fillet.
+    leg_height_for() below inverts that.
+    """
+    pts = [(x0, y_c)]
+    x = x0 + lead
+    pts.append((x, y_c))
+    y = y_c + leg_height / 2.0
+    pts.append((x, y))
+    for j in range(n_turns):
+        x += pitch
+        pts.append((x, y))
+        if j < n_turns - 1:
+            y = y_c - leg_height / 2.0 if y > y_c else y_c + leg_height / 2.0
         else:
-            finger_pair_index = j // 2
-            if finger_pair_index % 2 == 0:
-                # trunk finger: reaches out from the trunk, tip gap g from ground
-                polys.append(_rect(x_lo, y_center + w / 2 + h, x_hi, y_center + w / 2 + h + g, layer))
-                polys.append(_rect(x_lo, y_center - w / 2 - h - g, x_hi, y_center - w / 2 - h, layer))
-            else:
-                # ground finger: reaches in from ground, tip gap g from trunk
-                polys.append(_rect(x_lo, y_center + w / 2, x_hi, y_center + w / 2 + g, layer))
-                polys.append(_rect(x_lo, y_center - w / 2 - g, x_hi, y_center - w / 2, layer))
-
-    n_pairs = n_segments // 4
-    print(f"IDC: {n_pairs} interdigitated finger pairs packed into {n_segments * seg:.1f} um "
-          f"(target l0={l0:.1f} um)")
-    return polys, (x0 + n_segments * seg, y_center)
+            y = y_c
+        pts.append((x, y))
+    pts.append((x + lead, y_c))
+    return pts
 
 
-#---------------------------------------------#
-#  Meander/Bragg resonator (no left launcher)  #
-#---------------------------------------------#
-def build_layout(packing_scale, start_x):
+def leg_height_for(total, n_turns, pitch, lead, radius):
+    """Leg height that makes the filleted serpentine exactly `total` long."""
+    delta = (2.0 - np.pi / 2.0) * radius
+    return (total - 2.0 * lead - n_turns * pitch
+            + (2 * n_turns + 2) * delta) / n_turns
+
+
+# --------------------------------------------------------------------- #
+#                     Launcher placement helpers                        #
+# --------------------------------------------------------------------- #
+def _as_polygonset(polys, layer):
+    pts = []
+    for p in polys:
+        pts.extend(p.polygons)
+    return gdspy.PolygonSet(pts, layer=layer)
+
+
+def _span_at(ps, x, tol):
+    """Vertical extent of the polygon set in a thin slice around x."""
+    ys = []
+    for poly in ps.polygons:
+        x_lo, x_hi = poly[:, 0].min(), poly[:, 0].max()
+        if x_lo <= x + tol and x_hi >= x - tol:
+            ys += [poly[:, 1].min(), poly[:, 1].max()]
+    return (max(ys) - min(ys)) if ys else 0.0
+
+
+def build_launcher_template(layer):
     """
-    Builds the meander-Bragg resonator starting at x = start_x, with all
-    packing dimensions (radius, CPW cross-sections, launcher geometry)
-    multiplied by packing_scale. quarterwave_resonator_length is never
-    scaled, so resonant frequency stays fixed regardless of packing_scale.
+    Build one launcher and normalise it so its narrow (CPW) end is at x = 0
+    with the centre conductor on y = 0, and the pad extends toward +x.
 
-    Returns (list_of_polygons, chip_width_used) where chip_width_used is
-    the absolute rightmost x-coordinate reached (i.e. measured from x=0,
-    not from start_x).
+    Which end createLauncherRight puts the pad on is detected from the
+    geometry rather than assumed, so this does not depend on the module's
+    positional convention.
     """
-    radius = radius_0 * packing_scale
-    gap = gap_0 * packing_scale
-    width = width_0 * packing_scale
-    gap1, width1 = gap1_0 * packing_scale, width1_0 * packing_scale
-    gap2, width2 = gap2_0 * packing_scale, width2_0 * packing_scale
-    feedline_length = feedline_length_0 * packing_scale
-    straightLauncher = straightLauncher_0 * packing_scale
-    taperLauncher = taperLauncher_0 * packing_scale
-    launcherHeight = launcherHeight_0 * packing_scale
-    gapLauncher = gapLauncher_0 * packing_scale
-
-    length_circle = np.pi * radius * 2
-    length_straight = (quarterwave_resonator_length - length_circle) / 4
-    if length_straight <= 0:
-        raise ValueError(
-            f"packing_scale={packing_scale:.4f}: bend radius alone exceeds "
-            f"the quarter-wavelength -- shrink radius further."
-        )
-
-    if 7 * (2 * gap + width) > 2 * radius:
-        print(f"Warning (packing_scale={packing_scale:.4f}): CTL spacing may "
-              f"be too tight relative to bend radius.")
-
-    structure = []
-    start = [start_x, chip_height / 2]
-
-    [poly2, pos2] = GM.createCPWhor(start, length=feedline_length, gap=gap, width=width)
-    structure += poly2
-
-    [poly3, pos3] = GM.createDoublearc(
-        center=(pos2[0], pos2[1] + radius), radius=radius,
-        gap=gap, width=width, angle=np.pi * 3 / 2, layer=layer
+    raw, _ = GM.createLauncherRight(
+        (0.0, 0.0), gap=launcher_gap, width=launcher_width,
+        straight=straightLauncher, height=launcherHeight,
+        taper=taperLauncher, gapL=gapLauncher, notch=True
     )
-    pos3 = pos3[0] + radius, pos3[1] + radius
-    structure += poly3
+    ps = _as_polygonset(raw, layer)
+    (x_lo, y_lo), (x_hi, y_hi) = ps.get_bounding_box()
+    tol = 0.02 * (x_hi - x_lo)
+    if _span_at(ps, x_lo + tol, tol) > _span_at(ps, x_hi - tol, tol):
+        ps.mirror((0, 1))                       # pad was on the left; flip
+        (x_lo, y_lo), (x_hi, y_hi) = ps.get_bounding_box()
+    ps.translate(-x_lo, -0.5 * (y_lo + y_hi))
+    length = x_hi - x_lo
+    print(f"Launcher template: {length:.1f} um long, "
+          f"{y_hi - y_lo:.1f} um tall, narrow end normalised to x=0")
+    return ps, length
 
-    [poly4, pos4] = GM.CreateAlternateMeanderUp(
-        pos3, length=quarterwave_resonator_length,
-        no_meander=no_of_quarterwave_resonators,
-        radius=radius, gap1=gap1, width1=width1,
-        gap2=gap2, width2=width2, layer=layer
-    )
-    structure += poly4
 
-    [poly5, pos5] = GM.createCPWvertUp(pos4, length=length_straight, gap=gap, width=width, layer=layer)
+def place_launcher(template, attach_pt, side, layer):
+    """Copy the template so its narrow end sits on attach_pt, pad facing out."""
+    ps = gdspy.PolygonSet([p.copy() for p in template.polygons], layer=layer)
+    if side == 'left':
+        ps.mirror((0, 1))                       # pad now extends toward -x
+    ps.translate(attach_pt[0], attach_pt[1])
+    return ps
 
-    [poly6, pos6] = GM.createSemiarc(
-        (pos5[0] + radius, pos5[1]), radius=radius,
-        gap=gap, width=width, angle=np.pi * 2, layer=layer
-    )
-    structure += poly5 + poly6
 
-    [poly7, pos7] = GM.createCPWvertDown(pos6, length=length_straight, gap=gap, width=width, layer=layer)
-    structure += poly7   # NOTE: original script appended poly7 twice -- fixed here
+# --------------------------------------------------------------------- #
+#        Pick the fewest turns (= narrowest mirror) that fits           #
+# --------------------------------------------------------------------- #
+pitch = 2.0 * bend_radius + jog_margin
+cpw_halfspan = max(w / 2.0 + g for g, w in section_xsec)
+y_c = chip_height / 2.0
 
-    [poly8, pos_8] = GM.createDoublearc(
-        (pos7[0] + radius, pos7[1]), radius=radius,
-        gap=gap, width=width, angle=-np.pi, layer=layer
-    )
-    pos8 = (pos_8[0] + 2 * radius, pos_8[1] - radius)
-    structure += poly8
+launcher_template, launcher_len = build_launcher_template(layer)
 
-    [_, pos9] = GM.createLauncherRight(
-        pos8, gap=gap, width=width, straight=straightLauncher,
-        height=launcherHeight, taper=taperLauncher, gapL=gapLauncher, notch=True
-    )
-    pos9 = [pos8[0] - pos9[0] + pos8[0] - radius, pos8[1]]
+print("\nturns   leg height   mirror width   total width   vertical span")
+chosen = None
+for n_turns in range(turns_min, turns_max + 1):
+    h = leg_height_for(total_length, n_turns, pitch, lead_run, bend_radius)
+    span = h + 2.0 * cpw_halfspan
+    w_mirror = 2.0 * lead_run + n_turns * pitch
+    w_total = w_mirror + 2.0 * launcher_len
+    ok = (h >= 4.0 * bend_radius        # half legs are h/2, fillet at each end
+          and span <= chip_height - 2.0 * edge_margin
+          and w_total <= chip_width)
+    print(f"{n_turns:5d}   {h:10.1f}   {w_mirror:12.1f}   {w_total:11.1f}"
+          f"   {span:13.1f}   {'fits' if ok else ''}")
+    if ok and chosen is None:
+        x0 = 0.5 * (chip_width - w_total) + launcher_len
+        verts = serpentine_vertices(x0, y_c, n_turns, h, pitch, lead_run)
+        try:
+            chosen = (n_turns, h, w_total, verts,
+                      fillet_polyline(verts, bend_radius, arc_step_deg))
+        except ValueError:
+            chosen = None
 
-    [poly10, pos10] = GM.createLauncherRight(
-        pos9, gap=gap, width=width, straight=straightLauncher,
-        height=launcherHeight, taper=taperLauncher, gapL=gapLauncher, notch=True
-    )
-    structure += poly10
-
-    used_width = pos8[0] + 2 * gapLauncher + taperLauncher + straightLauncher - radius
-    return structure, used_width
-
-#---------------------------------------------#
-#  Auto-fit packing scale and place layout    #
-#  with a fixed left offset                   #
-#---------------------------------------------#
-# Calculate maximum width available for the meander section
-available_width = chip_width - idc_l0 - left_offset
-
-scale_lo, scale_hi = 0.05, 1.0
-best_scale = None
-for _ in range(40):
-    mid = (scale_lo + scale_hi) / 2
-    try:
-        _, w_end = build_layout(mid, start_x=0.0)
-    except ValueError:
-        scale_hi = mid
-        continue
-    
-    if w_end <= available_width:
-        best_scale = mid
-        scale_lo = mid
-    else:
-        scale_hi = mid
-
-if best_scale is None:
+if chosen is None:
     raise RuntimeError(
-        "No packing scale fits within the remaining chip space. "
-        "Try decreasing left_offset or reducing no_of_quarterwave_resonators."
+        "No turn count fits. Height is the binder: fewer turns means taller "
+        "legs. Either shrink bend_radius (narrower turns let you keep the "
+        "turn count up without widening the mirror), relax edge_margin, or "
+        "split the mirror into two stacked banks."
     )
 
-packing_scale = best_scale
+n_turns, leg_height, w_total, verts, dense = chosen
+actual_len = arclen(dense)
+print(f"\nSerpentine: {n_turns} turns, leg height {leg_height:.1f} um, "
+      f"pitch {pitch:.1f} um, radius {bend_radius:.1f} um")
+print(f"Centerline length {actual_len:.1f} um "
+      f"(target {total_length:.1f}, error {actual_len - total_length:+.3f})")
 
-# Position IDC starting at the custom left offset
-x_idc_start = left_offset
-feedline_start_x = x_idc_start + idc_l0
+# --------------------------------------------------------------------- #
+#          Cut into quarter-wave sections and lay down the CPW          #
+# --------------------------------------------------------------------- #
+runs, bounds = split_by_lengths(dense, section_lengths)
+assert len(runs) == no_of_quarterwave_resonators
 
-# Build geometry
-idc_polys, idc_end = build_IDC(x_idc_start, chip_height / 2, idc_l0, idc_w, idc_s, idc_h, idc_g, layer)
-resonator_polys, actual_right_edge = build_layout(packing_scale, feedline_start_x)
+mirror_polys = []
+for k, (run, (g_k, w_k)) in enumerate(zip(runs, section_xsec)):
+    mirror_polys.append(cpw_gaps(run, w_k, g_k, layer))
+    print(f"  section {k + 1}: len {arclen(run):8.1f} um  "
+          f"width {w_k:5.1f}  gap {g_k:5.1f}")
 
-total_structure = idc_polys + resonator_polys
+# Flag any impedance step that lands inside a bend rather than on a straight.
+for k, (q, i) in enumerate(bounds):
+    a = np.asarray(dense[max(i - 1, 0)])
+    b = np.asarray(dense[i])
+    cpt = np.asarray(dense[min(i + 2, len(dense) - 1)])
+    d1, d2 = _unit(b - a), _unit(cpt - b)
+    if abs(np.degrees(np.arccos(np.clip(np.dot(d1, d2), -1, 1)))) > 0.5:
+        print(f"  WARNING: step {k + 1}->{k + 2} at ({q[0]:.1f}, {q[1]:.1f}) "
+              f"falls inside a bend, not on a straight run.")
 
-print(f"Chosen packing scale: {packing_scale:.4f}")
-print(f"IDC starts at x = {x_idc_start:.1f} um (left offset applied).")
-print(f"Assembly spans x = {x_idc_start:.1f} to {actual_right_edge:.1f} um.")
+entry_pt = (float(dense[0][0]), float(dense[0][1]))
+exit_pt = (float(dense[-1][0]), float(dense[-1][1]))
 
-#---------------------------------------------#
-#         Boolean Merge and Background        #
-#---------------------------------------------#
+# --------------------------------------------------------------------- #
+#              Launchers butted onto both mirror ends                   #
+# --------------------------------------------------------------------- #
+launcher_l = place_launcher(launcher_template, entry_pt, 'left', layer)
+launcher_r = place_launcher(launcher_template, exit_pt, 'right', layer)
+
+for name, pt, (g_k, w_k) in (("left", entry_pt, section_xsec[0]),
+                             ("right", exit_pt, section_xsec[-1])):
+    step = abs((w_k / 2.0 + g_k) - (launcher_width / 2.0 + launcher_gap))
+    print(f"{name} launcher butts onto section cross-section "
+          f"{w_k:.0f}/{g_k:.0f} at x={pt[0]:.1f}; outer half-span step "
+          f"{step:.1f} um")
+
+total_structure = mirror_polys + [launcher_l, launcher_r]
+
+# --------------------------------------------------------------------- #
+#                          Fit report                                   #
+# --------------------------------------------------------------------- #
+def bbox_of(polys):
+    lo = np.array([np.inf, np.inf])
+    hi = np.array([-np.inf, -np.inf])
+    for p in polys:
+        bb = p.get_bounding_box()
+        if bb is None:
+            continue
+        lo = np.minimum(lo, bb[0])
+        hi = np.maximum(hi, bb[1])
+    return lo, hi
+
+
+lo, hi = bbox_of(total_structure)
+print(f"\nAssembly bbox: x {lo[0]:.1f} to {hi[0]:.1f} ({hi[0]-lo[0]:.1f} wide)")
+print(f"               y {lo[1]:.1f} to {hi[1]:.1f} ({hi[1]-lo[1]:.1f} tall)")
+print(f"Slack: left {lo[0]:.1f}, right {chip_width-hi[0]:.1f}, "
+      f"bottom {lo[1]:.1f}, top {chip_height-hi[1]:.1f} um")
+if min(lo[0], lo[1], chip_width - hi[0], chip_height - hi[1]) < 0:
+    print("ERROR: geometry runs off the chip.")
+if pitch - 2.0 * cpw_halfspan < 100.0:
+    print(f"WARNING: only {pitch - 2*cpw_halfspan:.1f} um of ground between "
+          f"adjacent legs. Check for leg-to-leg coupling and slotline modes; "
+          f"add airbridges or widen the pitch.")
+
+# --------------------------------------------------------------------- #
+#                   Boolean merge and background                        #
+# --------------------------------------------------------------------- #
 gdspy.current_library.cells.clear()
-
 merged_cell = gdspy.Cell('merge')
 merged_path = gdspy.fast_boolean(total_structure, None, 'or', max_points=0)
 
@@ -257,9 +397,6 @@ else:
 
 merged_cell.add(final_merged)
 
-#---------------------------------------------#
-#         Export GDSII and View Layout        #
-#---------------------------------------------#
 gdspy.write_gds(filename + ".gds", unit=1.0e-6, precision=1.0e-9)
 gdspy.LayoutViewer(cells=merged_cell)
 
