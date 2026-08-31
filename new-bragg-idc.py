@@ -28,16 +28,7 @@ gap1, width1 = 95, 4        # high-impedance section
 gap2, width2 = 52, 90       # low-impedance section
 
 # --- Launcher CPW cross-section ---
-# This is the line the bond pad tapers down into. It is NOT a section of the
-# layout -- there is no run of 50 ohm line anywhere. 30/50 gives ~50 ohm on
-# silicon, which is what you want the wirebond and coax to see. The mirror
-# butts straight onto it, so there is an abrupt step from the adjoining
-# section's cross-section (97 um outer half-span) to this one (55 um).
-# To remove the step instead, set these equal to the adjoining section --
-# but then the pad is no longer 50 ohm and the mismatch just moves to the
-# wirebond. Keeping it at 50 ohm is usually the right call: the step at the
-# mirror end is part of the mirror, the one at the pad is not.
-launcher_gap, launcher_width = 30, 50
+launcher_gap, launcher_width = 52, 90
 
 # --- Launcher (bond pad + taper; physical dimensions, NEVER scaled) ---
 straightLauncher = 500
