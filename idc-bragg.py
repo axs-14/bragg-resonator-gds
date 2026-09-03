@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thursday Aug 27 17:00:00 2026
-Modified: 5000 x 10000 um chip. Left launcher replaced with an IDC
-quarter-wave resonator, galvanically connected directly to section 1 of
-the stepped-impedance (meander Bragg) filter. Assembly centered on chip.
+5000 x 10000 um chip. Left launcher replaced with an IDC quarter-wave
+resonator, galvanically connected directly to section 1 of the
+stepped-impedance (meander Bragg) filter. Assembly centered on chip.
+
+IDC, mirror, and right launcher are exported on separate GDS layers so
+they can be independently selected in HFSS (mesh ops, boundary
+assignment) despite being touching, coplanar copper.
 
 @author: Aryan Soni
 """
 
 import numpy as np
 import gdspy
-import gds_maker as GM  # Used for right launcher only
+import gds_maker as GM  # used for right launcher only
 
 # --------------------------------------------------------------------- #
 #                         Design Parameters                             #
@@ -34,11 +37,10 @@ idc_g = 2.0                 # finger-tip-to-opposite-conductor clearance, um
 gap1, width1 = 95.0, 4.0    # high-impedance section (section 1 connects to IDC)
 gap2, width2 = 52.0, 90.0   # low-impedance section
 
-# --- Right Launcher CPW cross-section ---
-# Matches section 6 (low-Z)
+# --- Right launcher CPW cross-section (matches section 6, low-Z) ---
 launcher_r_gap, launcher_r_width = 52.0, 90.0
 
-# --- Right Launcher physical dimensions ---
+# --- Right launcher physical dimensions ---
 straightLauncher = 600.0
 taperLauncher = 600.0
 launcherHeight = 1075.0
@@ -56,7 +58,11 @@ frequency = 7.2e9           # Hz
 epsilon = 11.7              # relative permittivity
 c = 3.0e8                   # m/s
 no_of_quarterwave_resonators = 6
-layer = 1
+
+# --- GDS export layers (separate objects for HFSS mesh/boundary selection) ---
+layer_idc = 1
+layer_mirror = 2
+layer_launcher = 3
 
 quarterwave_resonator_length = 1e6 * c / (np.sqrt((epsilon + 1) / 2) * frequency * 4)
 
@@ -148,13 +154,11 @@ def cpw_gaps(pts, width, gap, layer):
 
 
 # --------------------------------------------------------------------- #
-#                      IDC Builder Function                             #
+#                          IDC builder                                  #
 # --------------------------------------------------------------------- #
 def build_IDC(x0, y_center, l0, w, s, h, g, layer):
-    """
-    Constructs the Interdigital Capacitor geometry at x0, y_center.
-    Returns (polygon_set_gaps, (end_x, end_y)).
-    """
+    """Interdigital capacitor at x0, y_center.
+    Returns (polygon_set, (end_x, end_y), actual_length)."""
     polys = []
     seg = s
     n_segments = int(l0 // seg)
@@ -180,7 +184,7 @@ def build_IDC(x0, y_center, l0, w, s, h, g, layer):
 
 
 # --------------------------------------------------------------------- #
-#                   Serpentine Mirror Centerline                        #
+#                   Serpentine mirror centerline                        #
 # --------------------------------------------------------------------- #
 def serpentine_vertices(x0, y_c, n_turns, leg_height, pitch, lead):
     pts = [(x0, y_c)]
@@ -206,7 +210,7 @@ def leg_height_for(total, n_turns, pitch, lead, radius):
 
 
 # --------------------------------------------------------------------- #
-#                       Right Launcher Helpers                          #
+#                       Right launcher helpers                          #
 # --------------------------------------------------------------------- #
 def _as_polygonset(polys, layer):
     pts = []
@@ -248,13 +252,13 @@ def place_launcher(template, attach_pt, layer):
 
 
 # --------------------------------------------------------------------- #
-#                Optimization & Centered Placement                      #
+#                Optimization & centered placement                      #
 # --------------------------------------------------------------------- #
 pitch = 2.0 * bend_radius + jog_margin
 cpw_halfspan = max(w / 2.0 + g for g, w in section_xsec)
 y_c = chip_height / 2.0
 
-tmpl_r, len_r = build_launcher_template(launcher_r_gap, launcher_r_width, "Right", layer)
+tmpl_r, len_r = build_launcher_template(launcher_r_gap, launcher_r_width, "Right", layer_launcher)
 
 chosen = None
 for n_turns in range(turns_min, turns_max + 1):
@@ -266,7 +270,6 @@ for n_turns in range(turns_min, turns_max + 1):
           and span <= chip_height - 2.0 * edge_margin
           and w_total <= chip_width)
     if ok and chosen is None:
-        # Calculate x0 so whole assembly (IDC + Mirror + Right Launcher) is horizontally centered
         x0_idc = 0.5 * (chip_width - w_total)
         x0_mirror = x0_idc + idc_l0
         verts = serpentine_vertices(x0_mirror, y_c, n_turns, h, pitch, lead_run)
@@ -283,24 +286,24 @@ n_turns, leg_height, w_total, x0_idc, x0_mirror, verts, dense = chosen
 
 # Build IDC
 idc_poly, idc_attach_end, actual_idc_len = build_IDC(
-    x0_idc, y_c, idc_l0, idc_w, idc_s, idc_h, idc_g, layer
+    x0_idc, y_c, idc_l0, idc_w, idc_s, idc_h, idc_g, layer_idc
 )
 
-# Build Mirror
+# Build mirror
 runs, bounds = split_by_lengths(dense, section_lengths)
 mirror_polys = []
 for k, (run, (g_k, w_k)) in enumerate(zip(runs, section_xsec)):
-    mirror_polys.append(cpw_gaps(run, w_k, g_k, layer))
+    mirror_polys.append(cpw_gaps(run, w_k, g_k, layer_mirror))
 
 exit_pt = (float(dense[-1][0]), float(dense[-1][1]))
 
-# Build Right Launcher
-launcher_r = place_launcher(tmpl_r, exit_pt, layer)
+# Build right launcher
+launcher_r = place_launcher(tmpl_r, exit_pt, layer_launcher)
 
 total_structure = [idc_poly] + mirror_polys + [launcher_r]
 
 # --------------------------------------------------------------------- #
-#                             Fit Report                                #
+#                             Fit report                                #
 # --------------------------------------------------------------------- #
 def bbox_of(polys):
     lo = np.array([np.inf, np.inf])
@@ -321,20 +324,33 @@ print(f"Slack: left {lo[0]:.1f}, right {chip_width-hi[0]:.1f}, "
       f"bottom {lo[1]:.1f}, top {chip_height-hi[1]:.1f} um")
 
 # --------------------------------------------------------------------- #
-#                      Boolean Merge & GDS Export                       #
+#                Boolean merge, layer split & GDS export                #
 # --------------------------------------------------------------------- #
 gdspy.current_library.cells.clear()
 merged_cell = gdspy.Cell('merge')
 merged_path = gdspy.fast_boolean(total_structure, None, 'or', max_points=0)
 
 if write_gaps:
-    final_merged = merged_path
+    source = merged_path
 else:
     chip_rect = gdspy.Rectangle((0, 0), (chip_width, chip_height))
-    subtracted_path = gdspy.fast_boolean(chip_rect, merged_path, 'not', layer=2)
-    final_merged = gdspy.fast_boolean(subtracted_path, None, 'or', max_points=0)
+    source = gdspy.fast_boolean(chip_rect, merged_path, 'not', max_points=0)
 
-merged_cell.add(final_merged)
+# Zone rectangles at the design's own boundaries (IDC/mirror junction,
+# mirror/launcher junction) so each region lands on its own GDS layer
+# and can be independently selected in HFSS despite being touching,
+# coplanar copper.
+idc_zone = gdspy.Rectangle((0, 0), (x0_mirror, chip_height))
+mirror_zone = gdspy.Rectangle((x0_mirror, 0), (exit_pt[0], chip_height))
+launcher_zone = gdspy.Rectangle((exit_pt[0], 0), (chip_width, chip_height))
+
+piece_idc = gdspy.fast_boolean(source, idc_zone, 'and', layer=layer_idc)
+piece_mirror = gdspy.fast_boolean(source, mirror_zone, 'and', layer=layer_mirror)
+piece_launcher = gdspy.fast_boolean(source, launcher_zone, 'and', layer=layer_launcher)
+
+for piece in (piece_idc, piece_mirror, piece_launcher):
+    if piece is not None:
+        merged_cell.add(piece)
 
 gdspy.write_gds(filename + ".gds", unit=1.0e-6, precision=1.0e-9)
 gdspy.LayoutViewer(cells=merged_cell)
