@@ -43,6 +43,8 @@ class Params:
     #   "cells"      -> gds_maker Bragg unit cells (4 quarter-wave sections per cell)
     #   "serpentine" -> one continuous serpentine per mirror on the feed axis, same section
     #                   sequence, height capped by mirror_height_max
+    #   "loops"      -> every quarter-wave section is leg + gds_maker loop (full size) + leg,
+    #                   loops alternating below / above the feed axis, S-jogs between sections
     mirror_style: str = "cells"
     mirror_height_max: Optional[float] = None   # outer height; None -> chip_height - 2*edge_margin - 2*mirror_clearance
     mirror_clearance: float = 50                # extra room kept inside the edge margin (top and bottom)
@@ -51,6 +53,7 @@ class Params:
                                                 # pitch > 2r puts a straight in each 180 deg turn
     mirror_lead: float = 50                     # horizontal run at each mirror end
     mirror_step_clear: float = 25               # min distance from an impedance step to a bend
+    loop_jog_extra: float = 0                   # "loops" style: extra straight in each S-jog (widens loop spacing)
     min_ground: Optional[float] = None          # min ground strip between adjacent legs (fab rule); None -> one CPW width
 
     # mirror periods (two per unit-cell structure)
@@ -185,6 +188,23 @@ class Params:
                 "height": (a if n == 0 else 2 * a) + cw + 2 * cg,
                 "length": self.cavity_len}
 
+    # ---- loop-per-section mirrors ------------------------------------- #
+    @property
+    def loop_len(self) -> float:
+        """Centreline length of gds_maker loop_down / loop_up."""
+        r = self.radius
+        return 2 * self.addlength + 2 * self.length1 + 4 * r + 3 * np.pi * r
+
+    @property
+    def jog_len(self) -> float:
+        return np.pi * self.radius + self.loop_jog_extra
+
+    def loop_leg(self, first=False, last=False) -> float:
+        """Leg length each side of a section's loop so the section is exactly one quarter wave."""
+        conn = (np.pi * self.radius / 2 if first else 0.0) + \
+               (np.pi * self.radius / 2 if last else self.jog_len)
+        return (self.qw - self.loop_len - conn) / 2
+
     # ---- serpentine mirrors -------------------------------------------- #
     @property
     def mir_r(self) -> float:
@@ -213,8 +233,21 @@ class Params:
     def check(self):
         if self.left_cells < 1 or self.right_cells < 1:
             raise ValueError("Each mirror needs at least 2 periods (one unit-cell structure).")
-        if self.mirror_style not in ("cells", "serpentine"):
-            raise ValueError("mirror_style must be 'cells' or 'serpentine'.")
+        if self.mirror_style not in ("cells", "serpentine", "loops"):
+            raise ValueError("mirror_style must be 'cells', 'serpentine' or 'loops'.")
+        if self.mirror_style == "loops":
+            seqs = self.mirror_sequences
+            xw = max(w + 2 * g for g, w in seqs[0] + seqs[1])
+            gap = 2 * self.radius + 2 * self.loop_jog_extra - xw   # ground between same-side loops
+            need = xw if self.min_ground is None else self.min_ground
+            if gap < need - 1e-9:
+                raise ValueError(f"Ground between neighbouring loops {gap:.1f} um < {need:g} um; "
+                                 f"increase loop_jog_extra.")
+            if self.loop_leg(first=True) < 0:
+                raise ValueError("Loop longer than a quarter wave; reduce length1 / addlength.")
+            if self.cavity_meander and self.cavity_first_up:
+                raise ValueError("mirror_style='loops' needs cavity_first_up=False: the mirror sections "
+                                 "beside the cavity loop upward, so the cavity must bend down.")
         if self.mirror_style == "serpentine":
             seqs = self.mirror_sequences
             xw = max(w + 2 * g for g, w in seqs[0] + seqs[1])
@@ -323,7 +356,7 @@ def cpw_meander(start, length, legs, radius, lead, gap, width, layer, first_up=T
     return polys, end, a
 
 
-def draw_route(start, ops, pieces, layer, tolerance=0.01):
+def draw_route(start, ops, pieces, layer, tolerance=0.01, heading=0.0):
     """Draw CPW gap slots along `ops`, switching cross-section per `pieces` [(length, gap, width)].
 
     Piece boundaries can fall anywhere, including inside arcs. Returns
@@ -334,7 +367,7 @@ def draw_route(start, ops, pieces, layer, tolerance=0.01):
     if abs(total_ops - total_pieces) > 1e-6:
         raise RuntimeError(f"Route length {total_ops:.4f} != section total {total_pieces:.4f} um.")
 
-    x, y, h = float(start[0]), float(start[1]), 0.0
+    x, y, h = float(start[0]), float(start[1]), float(heading)
     polys, bends, steps = [], [], []
     s_pos, k, k_rem = 0.0, 0, pieces[0][0]
 
@@ -460,6 +493,65 @@ def serpentine_mirror(p: Params, start, xsecs, feed_side):
     return polys, end, info
 
 
+def loop_mirror(p: Params, start, xsecs, first_down=True):
+    """Bragg mirror where every quarter-wave section is: leg, gds_maker loop, leg.
+
+    Starts and ends heading +x on the axis through `start`. Section loops alternate
+    below / above the axis; consecutive sections are joined by an S-jog (two quarter
+    arcs + loop_jog_extra) that spaces same-side loops 2*(4r + extra) apart. The entry
+    and exit quarter turns belong to the first / last section, the jog after a section
+    belongs to that section, so every section is exactly qw long (impedance steps sit
+    where a jog ends and the next leg begins).
+    """
+    r, n = p.radius, len(xsecs)
+    x, y = float(start[0]), float(start[1])
+    polys, lengths = [], []
+    down = first_down
+    lo_y, hi_y = y, y
+    for i, (g, w) in enumerate(xsecs):
+        first, last = i == 0, i == n - 1
+        leg = p.loop_leg(first=first, last=last)
+        if leg < 0:
+            raise ValueError("Loop longer than a quarter wave.")
+        sgn = -1 if down else 1                          # direction of this section's excursion
+        ops_a = ([("A", r, sgn * np.pi / 2)] if first else []) + [("S", leg)]
+        heading = 0.0 if first else sgn * np.pi / 2
+        pl, (x, y), _, _ = draw_route((x, y), ops_a, [(route_length(ops_a), g, w)], p.gap_layer,
+                                      heading=heading)
+        polys += pl
+        loop = GM.loop_down if down else GM.loop_up
+        pl, end = loop([x, y], addlength=p.addlength, length1=p.length1, radius=r,
+                       gap=g, width=w, layer=p.gap_layer)
+        polys += pl
+        x, y = float(end[0]), float(end[1])
+        back = -sgn                                       # heading back toward the axis
+        if last:
+            ops_b = [("S", leg), ("A", r, sgn * np.pi / 2)]       # turn to +x
+        else:
+            ops_b = [("S", leg), ("A", r, sgn * np.pi / 2), ("S", p.loop_jog_extra),
+                     ("A", r, -sgn * np.pi / 2)]                  # S-jog: +x by 2r + extra
+        ops_b = [op for op in ops_b if not (op[0] == "S" and op[1] <= 1e-9)]
+        pl, (x, y), _, _ = draw_route((x, y), ops_b, [(route_length(ops_b), g, w)], p.gap_layer,
+                                      heading=back * np.pi / 2)
+        polys += pl
+        lengths.append(route_length(ops_a) + p.loop_len + route_length(ops_b))
+        down = not down
+
+    if abs(y - start[1]) > 1e-6:
+        raise RuntimeError(f"Loop mirror did not return to its axis (dy = {y - start[1]:.3f} um).")
+    pts = np.vstack([pp for q in polys for pp in (q.polygons if hasattr(q, "polygons") else q.get_polygons())])
+    info = {"sections": n, "legs": n, "leg_first": p.loop_leg(first=True),
+            "leg_mid": p.loop_leg(), "leg_last": p.loop_leg(last=True),
+            "height": float(pts[:, 1].max() - pts[:, 1].min()), "width": x - float(start[0]),
+            "section_len_min": min(lengths), "section_len_max": max(lengths),
+            "radius": r, "pitch": 2 * (4 * r + p.loop_jog_extra),
+            "ground_between_legs": 2 * r + 2 * p.loop_jog_extra - max(w + 2 * g for g, w in xsecs),
+            "amplitude": float(max(pts[:, 1].max() - start[1], start[1] - pts[:, 1].min())),
+            "pad": 0.0, "extra_lead": 0.0, "min_step_to_bend": 0.0, "steps_in_bends": 0,
+            "step_clear_met": True}
+    return polys, (x, y), info
+
+
 def end_cap(p: Params, tip):
     """Open end above a downward line tip (no launcher)."""
     half = p.feed_width / 2.0 + p.feed_gap
@@ -521,14 +613,26 @@ def build(p: Params):
     pl, pos_c = GM.createCPWhor(pos_b, length=run, gap=fg, width=fw, layer=layer)
     polys += pl
 
-    serp = p.mirror_style == "serpentine"
     seq_left, seq_right = p.mirror_sequences
+    serp = p.mirror_style in ("serpentine", "loops")
+    # loops style: the outermost sections loop DOWN, away from the launchers' vertical feeds.
+    # With an even section count the sections next to the cavity then loop up, so the cavity
+    # must bend down (check() enforces cavity_first_up=False) or a ground pocket closes off.
+    n_right = len(seq_right)
+
+    def loops_first_down(side):
+        if side == "start":
+            return True                          # left mirror: first (outer) section down
+        return (n_right - 1) % 2 == 0            # right mirror: last (outer) section down
+
+    mirror_fn = ((lambda st, xs, side: loop_mirror(p, st, xs, first_down=loops_first_down(side)))
+                 if p.mirror_style == "loops" else
+                 (lambda st, xs, side: serpentine_mirror(p, st, xs, side)))
     mirrors = {}
     if serp:
         # mirror starts on the feed axis, heading +x
         marks = [len(polys)]
-        pl, pos, mirrors["left"] = serpentine_mirror(p, (float(pos_c[0]), float(pos_c[1])),
-                                                     seq_left, feed_side="start")
+        pl, pos, mirrors["left"] = mirror_fn((float(pos_c[0]), float(pos_c[1])), seq_left, "start")
         polys += pl
     else:
         # entry arc and run down to the left mirror
@@ -564,8 +668,7 @@ def build(p: Params):
 
     marks.append(len(polys))
     if serp:
-        pl, pos, mirrors["right"] = serpentine_mirror(p, (float(pos[0]), float(pos[1])),
-                                                      seq_right, feed_side="end")
+        pl, pos, mirrors["right"] = mirror_fn((float(pos[0]), float(pos[1])), seq_right, "end")
         polys += pl
         marks.append(len(polys))
         pos_e = (float(pos[0]), float(pos[1]))       # already horizontal on the feed axis
@@ -673,6 +776,12 @@ def layout(p: Params, verbose=True) -> dict:
 
     if verbose:
         for side, m_ in info["mirrors"].items():
+            if p.mirror_style == "loops":
+                print(f"Loop {side} mirror: {m_['sections']} quarter-wave sections (each exactly "
+                      f"{m_['section_len_max']:.1f} um), legs {m_['leg_first']:.0f}/{m_['leg_mid']:.0f}/"
+                      f"{m_['leg_last']:.0f} um, footprint {m_['width']:.1f} x {m_['height']:.1f} um, "
+                      f"ground between neighbouring loops {m_['ground_between_legs']:.0f} um")
+                continue
             print(f"Serpentine {side} mirror: {m_['sections']} quarter-wave sections, {m_['legs']} legs, "
                   f"r {m_['radius']:g}, pitch {m_['pitch']:g} (ground {m_['ground_between_legs']:g}), amplitude {m_['amplitude']:.1f} um, footprint {m_['width']:.1f} x "
                   f"{m_['height']:.1f} um; 50-ohm pad {m_['pad']:.0f} um, extra cavity-side lead {m_['extra_lead']:.0f} um; nearest step-to-bend "
@@ -708,6 +817,46 @@ def extract_trace(p: Params, chip_w, all_gaps, probes):
     return gdspy.PolygonSet(keep, layer=p.trace_layer)
 
 
+def check_integrity(p: Params, verbose=True) -> dict:
+    """Topology check on the merged geometry (slower than design_only: runs the booleans).
+
+    - trace continuous: both launchers sit on the same island of (chip NOT slots)
+    - floating ground: islands other than the main ground and the trace (isolated metal)
+    - section overlaps: slots of different sections intersecting
+    """
+    lay = layout(p, verbose=False)
+    gaps = gdspy.boolean(lay["gaps"], None, "or", max_points=0)
+    chip = gdspy.Rectangle((0, 0), (lay["chip_width"], p.chip_height))
+    solid = gdspy.boolean(chip, gaps, "not", max_points=0)
+    polys = solid.polygons if solid is not None else []
+    areas = [gdspy.PolygonSet([q]).area() for q in polys]
+    hits = [{i for i, q in enumerate(polys) if gdspy.inside([pt], [q])[0]} for pt in lay["probes"]]
+    trace_ids = hits[0] | hits[1]
+    ground_id = int(np.argmax(areas)) if areas else None
+    floating = [(np.round(polys[i].min(0)).tolist(), np.round(polys[i].max(0)).tolist())
+                for i in range(len(polys)) if i not in trace_ids and i != ground_id]
+
+    built, _, info = build(p)
+    merged = {n: gdspy.boolean(built[a:b], None, "or", max_points=0)
+              for n, (a, b) in info["sections"].items() if b > a}
+    names = list(merged)
+    overlaps = []
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            o = gdspy.boolean(merged[names[i]], merged[names[j]], "and", max_points=0)
+            if o is not None and o.area() > 1.0:
+                overlaps.append((names[i], names[j], round(o.area(), 1)))
+
+    out = {"trace_continuous": len(hits[0] & hits[1]) == 1, "floating_ground": floating,
+           "section_overlaps": overlaps}
+    out["ok"] = out["trace_continuous"] and not floating and not overlaps
+    if verbose:
+        print(f"Integrity: trace continuous {out['trace_continuous']}; floating ground islands "
+              f"{len(floating)}{' ' + str(floating) if floating else ''}; section overlaps "
+              f"{overlaps or 'none'} -> {'OK' if out['ok'] else 'PROBLEM'}")
+    return out
+
+
 def design_only(p: Params, verbose=True) -> dict:
     """Fit check without the CPW booleans or GDS write."""
     base = {"left_periods": p.left_periods, "right_periods": p.right_periods,
@@ -730,6 +879,10 @@ def design_only(p: Params, verbose=True) -> dict:
     ok = width_slack >= 0 and height_slack >= 0
 
     if verbose:
+        rp = p.left_periods if p.right_periods is None else p.right_periods
+        if p.mirror_style == "cells" and (p.left_periods % 2 or rp % 2):
+            print(f"NOTE: each unit cell is 2 periods, so {p.left_periods}/{rp} periods are drawn as "
+                  f"{2 * p.left_cells}/{2 * p.right_cells}.")
         print(f"Quarter-wave length {p.qw:.1f} um; mirrors {4 * p.left_cells} / "
               f"{4 * p.right_cells} quarter-wave sections ({2 * p.left_cells} / "
               f"{2 * p.right_cells} periods)")
