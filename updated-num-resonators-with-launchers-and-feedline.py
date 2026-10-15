@@ -5,7 +5,7 @@ from bragg_resonator import Params, check_integrity, design_only, fit, generate_
 
 
 # ---------------------------------------------------------------- run options
-OUTPUT_NAME = "bragg_mirror_7GHz_loops_8-4_2um_cavity"
+OUTPUT_NAME = "bragg_mirror_7GHz_loops_8-4_spine"
 VIEW = True
 WRITE_GAPS = False      # True: write trace + gap slots instead of ground + trace
 DRY_RUN = False         # True: stop after the fit check
@@ -47,13 +47,18 @@ CAVITY = dict(
     cavity_gap=24,
     cavity_width=2,
     cavity_length=6687.5,
+    cavity_radius=70,
+    cavity_pitch=140,
+    cavity_lead=50,             # raised automatically if a riser would crowd a mirror
+    cavity_spine=True,          # vertical straight for the sample; False -> meander settings below
+    spine_length=None,         # None -> longest possible; shorter leaves line for serpentines
+    spine_legs=None,
+    spine_pitch=None,           # spine-to-riser spacing; widen for room around the sample
+    spine_centered=False,       # True needs <= 6 left periods with loops (see notes)
+    cavity_first_up=True,       # spine: left half enters the spine at the top
     cavity_meander=True,
     cavity_flat=500,
     cavity_legs=0,
-    cavity_lead=50,
-    cavity_first_up=False,      # must be False with mirror_style="loops"
-    cavity_radius=70,
-    cavity_pitch=140,
 )
 
 PARAMS = Params(**CHIP, **ELECTRICAL, **MIRRORS, **FEEDLINE, **CAVITY)
