@@ -98,6 +98,15 @@ class Params:
     cavity_first_up: bool = True              # first excursion goes up (+y) or down (-y);
                                               # with 0 legs/half this is the only side used
 
+    # spine cavity: a vertical straight through the chip centre, reached from each mirror
+    # by an optional serpentine and a riser; the two halves are 180-degree images, so the
+    # spine midpoint is the electrical centre. cavity_first_up = left half enters the spine top.
+    cavity_spine: bool = False
+    spine_length: Optional[float] = None      # None -> longest the cavity length / chip height allow
+    spine_legs: Optional[int] = None          # serpentine legs per half; None -> fewest that fit
+    spine_pitch: Optional[float] = None       # spine-to-riser centre spacing; None -> cavity pitch
+    spine_centered: bool = True               # put the spine on the chip's vertical centre line
+
     # layers
     layer: int = 1        # ground
     trace_layer: int = 3
@@ -155,6 +164,21 @@ class Params:
     @property
     def cav_r(self) -> float:
         return self.radius if self.cavity_radius is None else self.cavity_radius
+
+    @property
+    def cav_mode(self) -> str:
+        if self.cavity_spine:
+            return "spine"
+        return "meander" if self.cavity_meander else "straight"
+
+    @property
+    def spine_d(self) -> float:
+        return self.cav_pitch if self.spine_pitch is None else self.spine_pitch
+
+    @property
+    def cav_xw(self) -> float:
+        g, w = self.cavity_xsec
+        return w + 2 * g
 
     @property
     def cav_pitch(self) -> float:
@@ -245,7 +269,7 @@ class Params:
                                  f"increase loop_jog_extra.")
             if self.loop_leg(first=True) < 0:
                 raise ValueError("Loop longer than a quarter wave; reduce length1 / addlength.")
-            if self.cavity_meander and self.cavity_first_up:
+            if self.cav_mode == "meander" and self.cavity_first_up:
                 raise ValueError("mirror_style='loops' needs cavity_first_up=False: the mirror sections "
                                  "beside the cavity loop upward, so the cavity must bend down.")
         if self.mirror_style == "serpentine":
@@ -263,7 +287,15 @@ class Params:
                 if v < 0:
                     raise ValueError(f"{name} is negative ({v:.2f} um); check radius, "
                                      f"length1, addlength, frequency, epsilon.")
-        if self.cavity_meander:
+        if self.cav_mode == "spine":
+            if self.spine_d < 2 * self.cav_r - 1e-9:
+                raise ValueError(f"spine_pitch {self.spine_d:g} < 2 x cavity radius {2 * self.cav_r:g} um.")
+            need = self.cav_xw if self.min_ground is None else self.min_ground
+            for name, d in (("cavity_pitch", self.cav_pitch), ("spine_pitch", self.spine_d)):
+                if d - self.cav_xw < need - 1e-9:
+                    raise ValueError(f"Ground at {name} = {d:g} um is {d - self.cav_xw:.1f} um < "
+                                     f"{need:g} um; increase {name}.")
+        if self.cav_mode == "meander":
             if self.cavity_flat < 0 or self.cavity_lead < 0:
                 raise ValueError("cavity_flat and cavity_lead must be >= 0.")
             cg, cw = self.cavity_xsec
@@ -552,6 +584,98 @@ def loop_mirror(p: Params, start, xsecs, first_down=True):
     return polys, (x, y), info
 
 
+def spine_plan(p: Params, lead: float) -> dict:
+    """Solve the spine cavity: spine length Vs, legs k per half, serpentine amplitude A.
+
+    Half (left) route: lead -> 90 deg bend -> [half leg, (k-1) x (U-turn + full leg), U-turn]
+    -> riser -> U-turn (spine pitch) -> spine. Lengths (r = radius, U(d) = pi*r + d - 2r):
+      k = 0 : half = lead + pi*r/2 + Vs/2 - r + U(D)
+      k >= 1: half = lead + pi*r/2 + k*U(d) + U(D) + Vs/2 - (2k+1)*r + 2k*A
+      total = 2*half + Vs
+    """
+    L, r, d, D, xw = p.cavity_len, p.cav_r, p.cav_pitch, p.spine_d, p.cav_xw
+    usable = p.chip_height - 2 * p.edge_margin
+    vs_cap = usable - 2 * r - xw                 # spine + its two U-turn apexes inside the margin
+    a_cap = min(p.cavity_amp_max, (usable - xw) / 2)
+    vs_zero_legs = (L - 2 * lead - np.pi * r + 2 * r - 2 * turn_len(r, D)) / 2
+
+    def amplitude(k, vs):
+        half = (L - vs) / 2
+        return (half - lead - np.pi * r / 2 - k * turn_len(r, d) - turn_len(r, D) - vs / 2
+                + (2 * k + 1) * r) / (2 * k)
+
+    if p.spine_length is None:
+        vs = min(vs_zero_legs, vs_cap)
+    else:
+        vs = float(p.spine_length)
+    if vs <= 0:
+        raise ValueError("Cavity too short for a spine with these radius / pitch / lead values.")
+    if vs > vs_cap + 1e-6:
+        raise ValueError(f"spine_length {vs:.0f} um exceeds the {vs_cap:.0f} um the chip height allows.")
+    if vs > vs_zero_legs + 1e-6:
+        raise ValueError(f"spine_length {vs:.0f} um needs more line than the cavity has; "
+                         f"max is {vs_zero_legs:.0f} um at this cavity_length.")
+
+    if abs(vs - vs_zero_legs) < 1e-6 and not p.spine_legs:
+        k, a = 0, None
+    elif p.spine_legs is not None:
+        k = int(p.spine_legs)
+        if k < 1:
+            raise ValueError("spine_legs = 0 only works with spine_length=None (the longest spine).")
+        a = amplitude(k, vs)
+    else:
+        k = next((n for n in range(1, 200) if amplitude(n, vs) <= a_cap), None)
+        if k is None:
+            raise ValueError("No leg count keeps the cavity serpentine inside the chip.")
+        a = amplitude(k, vs)
+    if a is not None and a < 2 * r:
+        raise ValueError(f"Serpentine amplitude {a:.1f} um < 2 x radius: too little spare line for "
+                         f"{k} legs; use fewer legs or a longer spine.")
+    if a is not None and a > a_cap + 1e-6:
+        raise ValueError(f"Serpentine amplitude {a:.1f} um exceeds {a_cap:.0f} um; use more legs.")
+
+    half_w = lead + r + k * d + D                 # x advance from mirror end to spine centreline
+    return {"type": "spine", "length": L, "spine_length": vs, "legs": k, "amplitude": a,
+            "lead": lead, "radius": r, "pitch": d, "spine_pitch": D,
+            "ground_between_legs": d - xw, "spine_ground": D - xw,
+            "width": 2 * half_w, "half_width": half_w,
+            "height": vs + 2 * r + xw if a is None else max(vs + 2 * r, 2 * a) + xw}
+
+
+def spine_ops(plan: dict, up: bool):
+    """Centreline ops for the full spine cavity, heading +x in and out on the same axis."""
+    r, d, D, k, a, vs, s = (plan["radius"], plan["pitch"], plan["spine_pitch"], plan["legs"],
+                            plan["amplitude"], plan["spine_length"], plan["lead"])
+    sg = 1 if up else -1                          # riser direction of the left half
+
+    def u_turn(direction, pitch):                 # direction: current vertical heading (+1 up)
+        return [("A", r, -direction * np.pi / 2), ("S", pitch - 2 * r), ("A", r, -direction * np.pi / 2)]
+
+    half = [("S", s)]
+    if k == 0:
+        half += [("A", r, sg * np.pi / 2), ("S", vs / 2 - r)]
+    else:
+        f = sg if k % 2 == 0 else -sg             # first leg direction, so the last leg runs against the riser
+        half += [("A", r, f * np.pi / 2), ("S", a - 2 * r)]
+        direction = f
+        for _ in range(k - 1):
+            half += u_turn(direction, d) + [("S", 2 * (a - r))]
+            direction = -direction
+        half += u_turn(direction, d) + [("S", vs / 2 + a - r)]
+    half += u_turn(sg, D)
+
+    right = [(op[0], op[1], -op[2]) if op[0] == "A" else op for op in reversed(half)]
+    ops = half + [("S", vs)] + right
+    return [op for op in ops if not (op[0] == "S" and op[1] <= 1e-9)]
+
+
+def side_extent(polys, y0, side, x_fn):
+    """x_fn (max or min) of slot vertices lying more than 30 um to `side` (+1 above / -1 below) of y0."""
+    pts = np.vstack([pp for q in polys for pp in (q.polygons if hasattr(q, "polygons") else q.get_polygons())])
+    sel = pts[side * (pts[:, 1] - y0) > 30.0]
+    return None if len(sel) == 0 else float(x_fn(sel[:, 0]))
+
+
 def end_cap(p: Params, tip):
     """Open end above a downward line tip (no launcher)."""
     half = p.feed_width / 2.0 + p.feed_gap
@@ -628,6 +752,18 @@ def build(p: Params):
     mirror_fn = ((lambda st, xs, side: loop_mirror(p, st, xs, first_down=loops_first_down(side)))
                  if p.mirror_style == "loops" else
                  (lambda st, xs, side: serpentine_mirror(p, st, xs, side)))
+    def right_mirror(start):
+        """Right mirror from `start` heading +x. Returns (polys, end, info or None)."""
+        if serp:
+            return mirror_fn((float(start[0]), float(start[1])), seq_right, "end")
+        pl_all, at = [], start
+        pl, at = GM.Braggmirror_unitcell2_right(at, **dict(right_kw, vertical_length5=L["vertical_length5"]))
+        pl_all += pl
+        for _ in range(p.right_cells - 1):
+            pl, at = GM.Braggmirror_unitcell1_right(at, **right_kw)
+            pl_all += pl
+        return pl_all, at, None
+
     mirrors = {}
     if serp:
         # mirror starts on the feed axis, heading +x
@@ -654,7 +790,36 @@ def build(p: Params):
     marks.append(len(polys))
     cg, cw = p.cavity_xsec
     info = {"cavity": None}
-    if p.cavity_meander:
+    if p.cav_mode == "spine":
+        cav_start = (float(pos[0]), float(pos[1]))
+        ground = p.min_ground if p.min_ground is not None else p.cav_pitch - p.cav_xw
+        left_polys = polys[marks[0]:]
+        right_polys0, _, _ = right_mirror((0.0, 0.0))
+        lead = p.cavity_lead
+        for _ in range(4):                       # lead can change the leg parity; settle it
+            plan = spine_plan(p, lead)
+            up = 1 if p.cavity_first_up else -1
+            depart = up if plan["legs"] % 2 == 0 else -up      # left half leaves the axis this way
+            need = lead
+            mx = side_extent(left_polys, cav_start[1], depart, np.max)
+            if mx is not None:
+                need = max(need, mx - cav_start[0] + ground + p.cav_xw / 2 - plan["radius"])
+            mn = side_extent(right_polys0, 0.0, -depart, np.min)
+            if mn is not None:
+                need = max(need, -mn + ground + p.cav_xw / 2 - plan["radius"])
+            if need <= lead + 1e-6:
+                break
+            lead = float(np.ceil(need))
+        ops = spine_ops(plan, p.cavity_first_up)
+        pl, end, _, _ = draw_route(cav_start, ops, [(route_length(ops), cg, cw)], layer)
+        if abs(route_length(ops) - p.cavity_len) > 1e-6 or abs(end[1] - cav_start[1]) > 1e-6:
+            raise RuntimeError("Spine cavity length or closure is wrong.")
+        polys += pl
+        pos = end
+        info["cavity"] = dict(plan, start=cav_start, spine_x=cav_start[0] + plan["half_width"],
+                              spine_y=(cav_start[1] - plan["spine_length"] / 2,
+                                       cav_start[1] + plan["spine_length"] / 2))
+    elif p.cav_mode == "meander":
         g = p.meander_geometry
         cav_start = (float(pos[0]), float(pos[1]))
         pl, pos, _ = cpw_meander(cav_start, p.cavity_len, g["legs"], g["radius"],
@@ -667,20 +832,13 @@ def build(p: Params):
         polys += pl
 
     marks.append(len(polys))
+    pl, pos, m_info = right_mirror(pos)
+    polys += pl
     if serp:
-        pl, pos, mirrors["right"] = mirror_fn((float(pos[0]), float(pos[1])), seq_right, "end")
-        polys += pl
+        mirrors["right"] = m_info
         marks.append(len(polys))
         pos_e = (float(pos[0]), float(pos[1]))       # already horizontal on the feed axis
     else:
-        # right mirror: unit cell 2, then unit cell 1 x (n-1)
-        pl, pos = GM.Braggmirror_unitcell2_right(
-            pos, **dict(right_kw, vertical_length5=L["vertical_length5"]))
-        polys += pl
-        for _ in range(p.right_cells - 1):
-            pl, pos = GM.Braggmirror_unitcell1_right(pos, **right_kw)
-            polys += pl
-
         # run down, arc to horizontal
         marks.append(len(polys))
         pl, pos_d = GM.createCPWvertDown(pos, length=L["downlength"], gap=fg, width=fw, layer=layer)
@@ -757,7 +915,11 @@ def layout(p: Params, verbose=True) -> dict:
                   if p.launchers else float(hi[0] + lo[0]))
     else:
         chip_w = float(p.chip_width)
-        dx = 0.5 * (chip_w - (hi[0] - lo[0])) - lo[0]   # centre in x
+        cav = info["cavity"]
+        if cav is not None and cav.get("type") == "spine" and p.spine_centered:
+            dx = chip_w / 2 - cav["spine_x"]             # spine on the chip centre line
+        else:
+            dx = 0.5 * (chip_w - (hi[0] - lo[0])) - lo[0]   # centre the assembly in x
         for g in gaps:
             g.translate(dx, 0.0)
         lo, hi = lo + np.array([dx, 0.0]), hi + np.array([dx, 0.0])
@@ -768,6 +930,13 @@ def layout(p: Params, verbose=True) -> dict:
         cav = info["cavity"]
         if cav is None:
             print(f"Straight cavity: {p.cavity_len:.1f} um")
+        elif cav.get("type") == "spine":
+            amp = "" if cav["amplitude"] is None else f", serpentine amplitude {cav['amplitude']:.1f} um"
+            print(f"Spine cavity: length {cav['length']:.1f} um; spine {cav['spine_length']:.1f} um at "
+                  f"x = {cav['spine_x'] + dx:.1f} (chip centre {chip_w / 2:.1f}), y {cav['spine_y'][0]:.0f} "
+                  f"to {cav['spine_y'][1]:.0f}; {cav['legs']} legs/half{amp}; lead {cav['lead']:.0f} um; "
+                  f"footprint {cav['width']:.1f} x {cav['height']:.1f} um; ground beside spine "
+                  f"{cav['spine_ground']:.0f} um")
         else:
             print(f"Serpentine cavity: length {cav['length']:.1f} um, {cav['legs']} legs/half, "
                   f"r {cav['radius']:g}, pitch {cav['pitch']:g} (ground {cav['ground_between_legs']:g}), "
@@ -861,7 +1030,7 @@ def design_only(p: Params, verbose=True) -> dict:
     """Fit check without the CPW booleans or GDS write."""
     base = {"left_periods": p.left_periods, "right_periods": p.right_periods,
             "frequency": p.frequency, "qw_um": p.qw, "cavity_um": p.cavity_len}
-    if p.cavity_meander:
+    if p.cav_mode == "meander":
         try:
             g = p.meander_geometry
             base.update(cavity_legs=g["legs"], cavity_amp_um=g["amplitude"],
