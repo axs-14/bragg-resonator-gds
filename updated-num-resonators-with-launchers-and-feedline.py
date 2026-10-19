@@ -5,11 +5,11 @@ from bragg_resonator import Params, check_integrity, design_only, fit, generate_
 
 
 # ---------------------------------------------------------------- run options
-OUTPUT_NAME = "bragg_mirror_7GHz_cellmeander_8-8_spine_sample"
+OUTPUT_NAME = "bragg_mirror_7GHz_cellmeander_8-8_spine"
 VIEW = True
-WRITE_GAPS = False      # True: write trace + gap slots instead of ground + trace
-DRY_RUN = False         # True: stop after the fit check
-SWEEP = None            # e.g. {"cavity_legs": [0, 1]}
+WRITE_GAPS = False          # True: trace + gap slots instead of ground + trace
+DRY_RUN = False             # True: stop after the fit check
+SWEEP = None                # e.g. {"left_periods": [6, 7, 8]}
 
 
 # ---------------------------------------------------------------- design
@@ -25,7 +25,7 @@ ELECTRICAL = dict(
 )
 
 MIRRORS = dict(
-    mirror_style="cell_meander",    # "cell_meander" | "loops" | "cells" | "serpentine"
+    mirror_style="cell_meander",    # "cell_meander" | "cells" | "loops" | "serpentine"
     left_periods=8,
     right_periods=8,
     gap1=23, width1=4,
@@ -34,7 +34,7 @@ MIRRORS = dict(
     radius=70,
     length1=337,
     addlength=150,
-    sections_per_column=3,          # quarter waves per 4-leg column; sets the leg height
+    sections_per_column=3,
     mirror_lead=50,
 )
 
@@ -46,26 +46,23 @@ FEEDLINE = dict(
 )
 
 CAVITY = dict(
+    cavity_style="spine",           # "spine" | "meander" | "straight"
     cavity_gap=24,
     cavity_width=2,
     cavity_length=6687.5,
     cavity_radius=70,
     cavity_pitch=140,
-    cavity_lead=50,             # raised automatically if a riser would crowd a mirror
-    cavity_spine=True,          # vertical straight for the sample; False -> meander settings below
-    spine_length=None,         # None -> longest possible; shorter leaves line for serpentines
-    spine_legs=None,
-    spine_pitch=None,           # spine-to-riser spacing; widened automatically for the sample
+    cavity_lead=50,
     spine_centered=True,
-    sample_size=500,            # square sample on the spine midpoint, marked on layer 10
-    sample_clearance=50,        # nothing but the spine within this distance of the sample
-    cavity_first_up=True,       # spine: left half enters the spine at the top
-    cavity_meander=True,
-    cavity_flat=500,
-    cavity_legs=0,
 )
 
-PARAMS = Params(**CHIP, **ELECTRICAL, **MIRRORS, **FEEDLINE, **CAVITY)
+SAMPLE = dict(
+    sample_size=500,                # 0 -> no sample keep-out
+    sample_clearance=50,
+    draw_sample=True,               # footprint on layer 10 of the GDS
+)
+
+PARAMS = Params(**CHIP, **ELECTRICAL, **MIRRORS, **FEEDLINE, **CAVITY, **SAMPLE)
 
 
 # ---------------------------------------------------------------- steps
@@ -83,12 +80,12 @@ def main():
         return None
 
     print("== fit check ==")
-    fit_result = design_only(p)
-    if not fit_result["ok"]:
-        print(f"Does not fit: {fit_result['error']}")
-        return fit_result
+    result = design_only(p)
+    if not result["ok"]:
+        print(f"Does not fit: {result['error']}")
+        return result
     if DRY_RUN:
-        return fit_result
+        return result
 
     print("\n== integrity check ==")
     integrity = check_integrity(p)
