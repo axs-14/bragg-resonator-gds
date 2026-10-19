@@ -5,7 +5,7 @@ from bragg_resonator import Params, check_integrity, design_only, fit, generate_
 
 
 # ---------------------------------------------------------------- run options
-OUTPUT_NAME = "bragg_mirror_7GHz_loops_8-4_spine"
+OUTPUT_NAME = "bragg_mirror_7GHz_cellmeander_8-8_spine_sample"
 VIEW = True
 WRITE_GAPS = False      # True: write trace + gap slots instead of ground + trace
 DRY_RUN = False         # True: stop after the fit check
@@ -25,21 +25,23 @@ ELECTRICAL = dict(
 )
 
 MIRRORS = dict(
-    mirror_style="loops",       # "loops" | "cells" | "serpentine"
+    mirror_style="cell_meander",    # "cell_meander" | "loops" | "cells" | "serpentine"
     left_periods=8,
-    right_periods=4,
+    right_periods=8,
     gap1=23, width1=4,
     gap2=4, width2=42,
     high_z_first=True,
     radius=70,
     length1=337,
     addlength=150,
+    sections_per_column=3,          # quarter waves per 4-leg column; sets the leg height
+    mirror_lead=50,
 )
 
 FEEDLINE = dict(
     feed_gap=14,
     feed_width=22,
-    feed_left=20,
+    feed_left=150,
     feed_right=150,
 )
 
@@ -53,8 +55,10 @@ CAVITY = dict(
     cavity_spine=True,          # vertical straight for the sample; False -> meander settings below
     spine_length=None,         # None -> longest possible; shorter leaves line for serpentines
     spine_legs=None,
-    spine_pitch=None,           # spine-to-riser spacing; widen for room around the sample
-    spine_centered=False,       # True needs <= 6 left periods with loops (see notes)
+    spine_pitch=None,           # spine-to-riser spacing; widened automatically for the sample
+    spine_centered=True,
+    sample_size=500,            # square sample on the spine midpoint, marked on layer 10
+    sample_clearance=50,        # nothing but the spine within this distance of the sample
     cavity_first_up=True,       # spine: left half enters the spine at the top
     cavity_meander=True,
     cavity_flat=500,
