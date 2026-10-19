@@ -54,6 +54,7 @@ class Params:
     mirror_lead: float = 50                     # horizontal run at each mirror end
     mirror_step_clear: float = 25               # min distance from an impedance step to a bend
     loop_jog_extra: float = 0                   # "loops" style: extra straight in each S-jog (widens loop spacing)
+    sections_per_column: float = 3              # "cell_meander": quarter waves per 4-leg column (sets leg height)
     min_ground: Optional[float] = None          # min ground strip between adjacent legs (fab rule); None -> one CPW width
 
     # mirror periods (two per unit-cell structure)
@@ -106,6 +107,9 @@ class Params:
     spine_legs: Optional[int] = None          # serpentine legs per half; None -> fewest that fit
     spine_pitch: Optional[float] = None       # spine-to-riser centre spacing; None -> cavity pitch
     spine_centered: bool = True               # put the spine on the chip's vertical centre line
+    sample_size: float = 500                  # square sample centred on the spine midpoint; 0 -> none
+    sample_clearance: float = 50              # min distance from the sample edge to any other line
+    sample_layer: int = 10                    # marker layer for the sample footprint in the GDS
 
     # layers
     layer: int = 1        # ground
@@ -173,7 +177,11 @@ class Params:
 
     @property
     def spine_d(self) -> float:
-        return self.cav_pitch if self.spine_pitch is None else self.spine_pitch
+        """Spine-to-riser centre spacing: requested pitch, widened to clear the sample square."""
+        d = self.cav_pitch if self.spine_pitch is None else self.spine_pitch
+        if self.sample_size > 0:
+            d = max(d, self.sample_size / 2 + self.sample_clearance + self.cav_xw / 2)
+        return d
 
     @property
     def cav_xw(self) -> float:
@@ -252,14 +260,17 @@ class Params:
         right [second, first] x 2 per cell.
         """
         (lf, ls), (rf, rs) = self.mirror_xsecs
+        if self.mirror_style == "cell_meander":          # any whole number of periods
+            rp = self.left_periods if self.right_periods is None else self.right_periods
+            return [lf, ls] * self.left_periods, [rs, rf] * rp
         return [lf, ls] * (2 * self.left_cells), [rs, rf] * (2 * self.right_cells)
 
     def check(self):
         if self.left_cells < 1 or self.right_cells < 1:
             raise ValueError("Each mirror needs at least 2 periods (one unit-cell structure).")
-        if self.mirror_style not in ("cells", "serpentine", "loops"):
-            raise ValueError("mirror_style must be 'cells', 'serpentine' or 'loops'.")
-        if self.mirror_style == "loops":
+        if self.mirror_style not in ("cells", "serpentine", "loops", "cell_meander"):
+            raise ValueError("mirror_style must be 'cells', 'serpentine', 'loops' or 'cell_meander'.")
+        if self.mirror_style in ("loops", "cell_meander"):
             seqs = self.mirror_sequences
             xw = max(w + 2 * g for g, w in seqs[0] + seqs[1])
             gap = 2 * self.radius + 2 * self.loop_jog_extra - xw   # ground between same-side loops
@@ -584,6 +595,152 @@ def loop_mirror(p: Params, start, xsecs, first_down=True):
     return polys, (x, y), info
 
 
+def loop_ops(r, add, l1, top):
+    """gds_maker loop_up (top=True, heading up) / loop_down as route ops; ends 2r to the right."""
+    s = 1 if top else -1
+    return [("S", add), ("A", r, s * np.pi / 2), ("A", r, -s * np.pi / 2), ("S", l1),
+            ("A", r, -s * np.pi / 2), ("S", 4 * r), ("A", r, -s * np.pi / 2), ("S", l1),
+            ("A", r, -s * np.pi / 2), ("A", r, s * np.pi / 2), ("S", add)]
+
+
+def cell_meander_ops(p: Params, legs: int, F: float, lead_a: float, lead_b: float, drop: float = 0.0,
+                     flip: bool = False):
+    """The gds_maker cell pattern as one continuous meander with leg height F.
+
+    Legs 2r apart; top turns go loop, U, loop, U..., bottom turns U, loop, U..., so loops on
+    each side are 8r apart as in the cells. Starts and ends heading +x on the axis with half
+    legs. The last turn is a plain U-turn lowered by `drop` (shortening the last two legs),
+    which closes the total length. Returns (ops, is_leg flags).
+    """
+    r, add, l1 = p.radius, p.addlength, p.length1
+    ops, leg = [("S", lead_a), ("A", r, np.pi / 2), ("S", F / 2 - r)], [False, False, True]
+    for i in range(legs - 1):
+        last_turn = i == legs - 2
+        if i % 2 == 0:                                    # top turn: heading up -> down
+            loop = i % 4 == 0 and not last_turn
+            turn = loop_ops(r, add, l1, True) if loop else [("A", r, -np.pi)]
+        else:                                             # bottom turn: heading down -> up
+            loop = i % 4 == 3 and not last_turn
+            turn = loop_ops(r, add, l1, False) if loop else [("A", r, np.pi)]
+        if last_turn:
+            ops[-1] = ("S", ops[-1][1] - drop)            # shorten the leg into the lowered U-turn
+        ops += turn
+        leg += [False] * len(turn)
+        ops.append(("S", F / 2 - r - drop if last_turn else F))
+        leg.append(True)
+    going_up = (legs - 1) % 2 == 0
+    ops += [("A", r, -np.pi / 2 if going_up else np.pi / 2), ("S", lead_b)]
+    leg += [False, False]
+    if flip:                                              # mirror the pattern about the axis
+        ops = [(op[0], op[1], -op[2]) if op[0] == "A" else op for op in ops]
+    keep = [i for i, op in enumerate(ops) if not (op[0] == "S" and op[1] <= 1e-9)]
+    return [ops[i] for i in keep], [leg[i] for i in keep]
+
+
+def cell_launcher_side_flip(legs: int, feed_at_start: bool) -> bool:
+    """Orientation that keeps the loop bulb nearest the launcher below the axis.
+
+    Unflipped, turn i is at the top for even i; loops sit at i % 4 in (0, 3); the last turn
+    is a plain U-turn.
+    """
+    loops = [i for i in range(legs - 2) if i % 4 in (0, 3)]
+    if not loops:
+        return False
+    i = loops[0] if feed_at_start else loops[-1]
+    return i % 2 == 0                                     # nearest loop on top -> flip it below
+
+
+def cell_column_F(p: Params) -> float:
+    """Leg height that puts exactly sections_per_column quarter waves in each 4-leg column."""
+    r = p.radius
+    turns = 2 * (2 * p.addlength + 2 * p.length1 + 4 * r + 3 * np.pi * r) + 2 * np.pi * r
+    return (p.sections_per_column * p.qw - turns) / 4
+
+
+def cell_meander_mirror(p: Params, start, xsecs, feed_side):
+    """Bragg mirror drawn as the cell pattern, periodic so impedance steps repeat per column.
+
+    Leg height F is fixed by sections_per_column. Knobs: 50-ohm line at the feed end (sets
+    where the steps fall on the legs) and the drop of the last U-turn (closes the length).
+    Every step must sit on a straight leg at least mirror_step_clear from either end.
+    """
+    r, qw, lead = p.radius, p.qw, p.mirror_lead
+    feed = (p.feed_gap, p.feed_width)
+    xw = max(w + 2 * g for g, w in xsecs)
+    loop_h = p.addlength + p.length1 + 3 * r
+    f_max = p.chip_height - 2 * p.edge_margin - 2 * p.mirror_clearance - 2 * loop_h - xw
+    F = cell_column_F(p)
+    if F > f_max:
+        raise ValueError(f"sections_per_column={p.sections_per_column:g} needs {F:.0f} um legs; "
+                         f"only {f_max:.0f} um fit. Lower it.")
+    left = feed_side == "start"
+    n_qw = len(xsecs) * qw
+
+    def pieces(pad):
+        sec = [(qw, g, w) for g, w in xsecs]
+        return [(lead + pad, *feed)] + sec if left else sec + [(lead + pad, *feed)]
+
+    def clearance(ops, flags, pcs):
+        lens = np.array([op[1] if op[0] == "S" else abs(op[2]) * op[1] for op in ops])
+        s0 = np.concatenate(([0.0], np.cumsum(lens)[:-1]))
+        fl = np.array(flags)
+        a, b = s0[fl], (s0 + lens)[fl]
+        worst = np.inf
+        for st in np.cumsum([pc[0] for pc in pcs])[:-1]:
+            inside = (st >= a) & (st <= b)
+            if not inside.any():
+                return -1.0
+            worst = min(worst, float(np.max(np.minimum(st - a[inside], b[inside] - st))))
+        return worst
+
+    drop_max = F / 2 - r - 2 * p.mirror_step_clear
+    best = None
+    for n in range(2, 400):
+        flip = cell_launcher_side_flip(n, left)
+        r0 = route_length(cell_meander_ops(p, n, F, lead, lead, flip=flip)[0])
+        pad_lo = max(0.0, r0 - 2 * drop_max - lead - n_qw)
+        pad_hi = min(qw + 2000.0, r0 - lead - n_qw)
+        if pad_hi < 0:
+            continue
+        for pad in np.arange(np.ceil(pad_lo / 2) * 2, pad_hi + 1e-9, 2.0):
+            drop = (r0 - lead - n_qw - pad) / 2
+            ops, flags = cell_meander_ops(p, n, F, lead, lead, drop, flip)
+            pcs = pieces(pad)
+            c = clearance(ops, flags, pcs)
+            if best is None or c > best[0]:
+                best = (c, n, pad, drop, ops, pcs)
+            if c >= p.mirror_step_clear:
+                break
+        if best is not None and best[0] >= p.mirror_step_clear:
+            break
+        if pad_lo > qw + 2000.0:
+            break
+    if best is None:
+        raise ValueError("Could not lay out the cell_meander mirror.")
+    clear, n, pad, drop, ops, pcs = best
+    if clear < p.mirror_step_clear:
+        print(f"WARNING: {'left' if left else 'right'} mirror: nearest impedance step is {clear:.1f} um "
+              f"from a leg end (target {p.mirror_step_clear:g}).")
+
+    polys, end, bends, steps = draw_route(start, ops, pcs, p.gap_layer)
+    if abs(end[1] - start[1]) > 1e-6:
+        raise RuntimeError("cell_meander mirror did not close on its axis.")
+    if abs(route_length(ops) - sum(pc[0] for pc in pcs)) > 1e-6:
+        raise RuntimeError("cell_meander mirror length mismatch.")
+    edges = [0.0] + steps + [route_length(ops)]
+    seg = np.diff(edges)
+    sec_lens = seg[1:] if left else seg[:-1]
+    pts = np.vstack([pp for q in polys for pp in (q.polygons if hasattr(q, "polygons") else q.get_polygons())])
+    info = {"sections": len(xsecs), "legs": n, "leg_height": F, "pad": pad, "tail_drop": drop,
+            "min_step_to_bend": clear, "steps_in_bends": 0, "step_clear_met": clear >= p.mirror_step_clear,
+            "section_len_min": float(sec_lens.min()), "section_len_max": float(sec_lens.max()),
+            "width": end[0] - float(start[0]), "height": float(pts[:, 1].max() - pts[:, 1].min()),
+            "radius": r, "pitch": 2 * r, "ground_between_legs": 2 * r - xw,
+            "amplitude": float(max(pts[:, 1].max() - start[1], start[1] - pts[:, 1].min())),
+            "extra_lead": 0.0}
+    return polys, end, info
+
+
 def spine_plan(p: Params, lead: float) -> dict:
     """Solve the spine cavity: spine length Vs, legs k per half, serpentine amplitude A.
 
@@ -738,7 +895,7 @@ def build(p: Params):
     polys += pl
 
     seq_left, seq_right = p.mirror_sequences
-    serp = p.mirror_style in ("serpentine", "loops")
+    serp = p.mirror_style in ("serpentine", "loops", "cell_meander")
     # loops style: the outermost sections loop DOWN, away from the launchers' vertical feeds.
     # With an even section count the sections next to the cavity then loop up, so the cavity
     # must bend down (check() enforces cavity_first_up=False) or a ground pocket closes off.
@@ -749,9 +906,12 @@ def build(p: Params):
             return True                          # left mirror: first (outer) section down
         return (n_right - 1) % 2 == 0            # right mirror: last (outer) section down
 
-    mirror_fn = ((lambda st, xs, side: loop_mirror(p, st, xs, first_down=loops_first_down(side)))
-                 if p.mirror_style == "loops" else
-                 (lambda st, xs, side: serpentine_mirror(p, st, xs, side)))
+    if p.mirror_style == "loops":
+        mirror_fn = lambda st, xs, side: loop_mirror(p, st, xs, first_down=loops_first_down(side))
+    elif p.mirror_style == "cell_meander":
+        mirror_fn = lambda st, xs, side: cell_meander_mirror(p, st, xs, side)
+    else:
+        mirror_fn = lambda st, xs, side: serpentine_mirror(p, st, xs, side)
     def right_mirror(start):
         """Right mirror from `start` heading +x. Returns (polys, end, info or None)."""
         if serp:
@@ -945,6 +1105,12 @@ def layout(p: Params, verbose=True) -> dict:
 
     if verbose:
         for side, m_ in info["mirrors"].items():
+            if p.mirror_style == "cell_meander":
+                print(f"Cell-meander {side} mirror: {m_['sections']} quarter-wave sections "
+                      f"({m_['section_len_min']:.1f}-{m_['section_len_max']:.1f} um), {m_['legs']} legs of "
+                      f"{m_['leg_height']:.0f} um, footprint {m_['width']:.0f} x {m_['height']:.0f} um, "
+                      f"50-ohm pad {m_['pad']:.0f} um, nearest step to a leg end {m_['min_step_to_bend']:.1f} um")
+                continue
             if p.mirror_style == "loops":
                 print(f"Loop {side} mirror: {m_['sections']} quarter-wave sections (each exactly "
                       f"{m_['section_len_max']:.1f} um), legs {m_['leg_first']:.0f}/{m_['leg_mid']:.0f}/"
@@ -968,7 +1134,17 @@ def layout(p: Params, verbose=True) -> dict:
                           "left": slo[0] - m, "right": chip_w - shi[0] - m,
                           "bottom": slo[1] - m, "top": H - shi[1] - m}
 
+    sample = None
+    cav = info["cavity"]
+    if cav is not None and cav.get("type") == "spine" and p.sample_size > 0:
+        sx, sy, h = cav["spine_x"] + dx, cav["start"][1], p.sample_size / 2
+        sample = (sx - h, sy - h, sx + h, sy + h)
+        if verbose:
+            print(f"Sample footprint: {p.sample_size:g} x {p.sample_size:g} um centred at "
+                  f"({sx:.1f}, {sy:.1f}); spine-to-riser spacing {p.spine_d:.0f} um")
+
     return {"gaps": gaps, "probes": [(x + dx, y) for x, y in info["probes"]],
+            "sample": sample,
             "lo": lo, "hi": hi, "chip_width": chip_w, "cavity": info["cavity"],
             "sections": sections, "mirrors": info["mirrors"]}
 
@@ -1017,12 +1193,26 @@ def check_integrity(p: Params, verbose=True) -> dict:
                 overlaps.append((names[i], names[j], round(o.area(), 1)))
 
     out = {"trace_continuous": len(hits[0] & hits[1]) == 1, "floating_ground": floating,
-           "section_overlaps": overlaps}
+           "section_overlaps": overlaps, "sample_clearance": None}
     out["ok"] = out["trace_continuous"] and not floating and not overlaps
+    if lay["sample"] is not None:
+        x0, y0, x1, y1 = lay["sample"]
+        sx = (x0 + x1) / 2
+        spine_strip = gdspy.Rectangle((sx - p.cav_xw / 2 - 0.5, y0 - p.sample_size),
+                                      (sx + p.cav_xw / 2 + 0.5, y1 + p.sample_size))
+        others = gdspy.boolean(gaps, spine_strip, "not", max_points=0)
+        square = gdspy.Rectangle((x0, y0), (x1, y1))
+        grown = gdspy.offset(square, p.sample_clearance - 1e-3, join="round", tolerance=0.5)
+        intrude = gdspy.boolean(others, grown, "and", max_points=0)
+        clear_ok = intrude is None or intrude.area() < 1e-6
+        out["sample_clearance"] = clear_ok
+        out["ok"] = out["ok"] and clear_ok
     if verbose:
+        sample = ("" if out["sample_clearance"] is None else
+                  f"; sample keep-out {'clear' if out['sample_clearance'] else 'VIOLATED'}")
         print(f"Integrity: trace continuous {out['trace_continuous']}; floating ground islands "
               f"{len(floating)}{' ' + str(floating) if floating else ''}; section overlaps "
-              f"{overlaps or 'none'} -> {'OK' if out['ok'] else 'PROBLEM'}")
+              f"{overlaps or 'none'}{sample} -> {'OK' if out['ok'] else 'PROBLEM'}")
     return out
 
 
@@ -1047,14 +1237,15 @@ def design_only(p: Params, verbose=True) -> dict:
     height_slack = float(min(lo[1], p.chip_height - hi[1])) - m
     ok = width_slack >= 0 and height_slack >= 0
 
+    seq_l, seq_r = p.mirror_sequences
+    periods_l, periods_r = len(seq_l) // 2, len(seq_r) // 2
     if verbose:
         rp = p.left_periods if p.right_periods is None else p.right_periods
-        if p.mirror_style == "cells" and (p.left_periods % 2 or rp % 2):
-            print(f"NOTE: each unit cell is 2 periods, so {p.left_periods}/{rp} periods are drawn as "
-                  f"{2 * p.left_cells}/{2 * p.right_cells}.")
-        print(f"Quarter-wave length {p.qw:.1f} um; mirrors {4 * p.left_cells} / "
-              f"{4 * p.right_cells} quarter-wave sections ({2 * p.left_cells} / "
-              f"{2 * p.right_cells} periods)")
+        if (periods_l, periods_r) != (p.left_periods, rp):
+            print(f"NOTE: this mirror style draws whole 2-period cells, so {p.left_periods}/{rp} "
+                  f"periods are drawn as {periods_l}/{periods_r}.")
+        print(f"Quarter-wave length {p.qw:.1f} um; mirrors {len(seq_l)} / {len(seq_r)} quarter-wave "
+              f"sections ({periods_l} / {periods_r} periods)")
         print(f"Assembly: {hi[0] - lo[0]:.1f} x {hi[1] - lo[1]:.1f} um; slack x {width_slack:.1f}, "
               f"y {height_slack:.1f} um ({'fits' if ok else 'DOES NOT FIT'})")
         print("Per-section clearance beyond the edge margin (negative = intrudes), um:")
@@ -1065,7 +1256,7 @@ def design_only(p: Params, verbose=True) -> dict:
                   f"{s['top']:9.1f}   {s['lo'][1]:.0f} to {s['hi'][1]:.0f}{flag}")
 
     out = {"ok": ok, **base,
-           "left_sections": 2 * p.left_cells, "right_sections": 2 * p.right_cells,
+           "left_sections": periods_l, "right_sections": periods_r,
            "chip_width_um": lay["chip_width"],
            "width_um": float(hi[0] - lo[0]), "height_um": float(hi[1] - lo[1]),
            "width_slack_um": width_slack, "height_slack_um": height_slack}
@@ -1128,6 +1319,10 @@ def generate_gds(p: Params, filename: str, write_gaps=False, view=False, verbose
             cell.add(gds_safe(ground) if hasattr(ground, "fracture") else ground)
         if trace is not None:
             cell.add(gds_safe(trace))
+
+    if lay["sample"] is not None:
+        x0, y0, x1, y1 = lay["sample"]
+        cell.add(gdspy.Rectangle((x0, y0), (x1, y1), layer=p.sample_layer))
 
     out_name = filename + ".gds"
     gdspy.write_gds(out_name, unit=1.0e-6, precision=1.0e-9)
