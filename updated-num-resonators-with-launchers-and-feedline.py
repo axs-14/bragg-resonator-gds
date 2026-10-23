@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
-"""run_bragg.py -- build one Bragg resonator chip with bragg_resonator.py."""
+"""Build one Bragg resonator chip with bragg_resonator.py."""
 
 from bragg_resonator import Params, check_integrity, design_only, fit, generate_gds
 
 
-# ---------------------------------------------------------------- run options
-OUTPUT_NAME = "bragg_mirror_7GHz_cellmeander_8-8_spine"
+# --------------------------------------------------------------------------- run options
+OUTPUT_NAME = "bragg_7GHz_continuous_5-5_pitch200"
 VIEW = True
-WRITE_GAPS = False          # True: trace + gap slots instead of ground + trace
-DRY_RUN = False             # True: stop after the fit check
-SWEEP = None                # e.g. {"left_periods": [6, 7, 8]}
+WRITE_GAPS = False      # True: trace + gap slots instead of ground + trace
+DRY_RUN = False         # True: stop after the fit check
+SWEEP = None            # e.g. {"cell_pitch": [180, 190, 200]}
 
 
-# ---------------------------------------------------------------- design
+# --------------------------------------------------------------------------- design
 CHIP = dict(
     chip_width=10000,
     chip_height=5000,
@@ -25,15 +25,17 @@ ELECTRICAL = dict(
 )
 
 MIRRORS = dict(
-    mirror_style="cell_meander",    # "cell_meander" | "cells" | "loops" | "serpentine"
-    left_periods=8,
-    right_periods=8,
+    mirror_style="cell_meander",
+    symmetric=True,
+    left_periods=5,
+    right_periods=5,
     gap1=23, width1=4,
     gap2=4, width2=42,
     high_z_first=True,
     radius=70,
     length1=337,
     addlength=150,
+    cell_pitch=200,     # ground between legs = pitch - 50
     sections_per_column=3,
     mirror_lead=50,
 )
@@ -41,31 +43,28 @@ MIRRORS = dict(
 FEEDLINE = dict(
     feed_gap=14,
     feed_width=22,
-    feed_left=150,
-    feed_right=150,
+    feed_left=20,
 )
 
 CAVITY = dict(
-    cavity_style="spine",           # "spine" | "meander" | "straight"
+    cavity_style="continuous",
     cavity_gap=24,
     cavity_width=2,
-    cavity_length=6687.5,
-    cavity_radius=70,
-    cavity_pitch=140,
-    cavity_lead=50,
-    spine_centered=True,
+    cavity_length=None,     # half wave
+    cavity_flat=1000,       # minimum flat
+    flat_clearance=100,
 )
 
 SAMPLE = dict(
-    sample_size=500,                # 0 -> no sample keep-out
+    sample_size=500,
     sample_clearance=50,
-    draw_sample=True,               # footprint on layer 10 of the GDS
+    draw_sample=True,       # layer 10
 )
 
 PARAMS = Params(**CHIP, **ELECTRICAL, **MIRRORS, **FEEDLINE, **CAVITY, **SAMPLE)
 
 
-# ---------------------------------------------------------------- steps
+# --------------------------------------------------------------------------- steps
 def choose_params():
     if not SWEEP:
         return PARAMS
